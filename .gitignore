@@ -1,0 +1,11 @@
+# Build output (build.sh and test.sh)
+build/
+
+# Files made while trying the app out
+*.tar
+*.tar.gz
+*.tar.xz
+*.tar.part
+
+# macOS Finder metadata
+.DS_Store
