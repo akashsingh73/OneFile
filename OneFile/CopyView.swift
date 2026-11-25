@@ -25,6 +25,9 @@ struct CopyScreen: View {
             ProblemsSheet(title: "Not copied", problems: model.summary?.problems ?? [],
                           count: model.summary?.problemCount ?? 0) { model.showingProblems = false }
         }
+        .sheet(isPresented: $model.showingExtras) {
+            ExtrasSheet(model: model, extras: model.summary?.extras ?? [])
+        }
     }
 
     private var flowMode: FlowStream.Mode {
@@ -201,7 +204,9 @@ struct CopyPanel: View {
                 percent: model.percentText,
                 chip: (model.plan.clone ? "Cloning" : "\(model.plan.workers) at a time", model.plan.clone ? "plus.square.on.square" : "square.stack.3d.up.fill"),
                 eta: model.etaText,
-                bars: [.init(label: nil, fraction: model.progress.saving ? 1 : model.fraction)],
+                bars: [.init(label: nil, fraction: model.progress.verifying
+                             ? Double(model.progress.verified) / Double(max(model.progress.toVerify, 1))
+                             : model.progress.saving ? 1 : model.fraction)],
                 tiles: [
                     .init(label: "Files", value: Format.count(model.progress.files + model.progress.unchanged), detail: model.filesDetail),
                     .init(label: "Data", value: Format.bytes(model.progress.bytes + model.progress.unchangedBytes), detail: model.dataDetail),
@@ -214,6 +219,8 @@ struct CopyPanel: View {
                 current: model.progress.current,
                 warning: model.progress.problemCount > 0
                     ? "\(Format.items(Int64(model.progress.problemCount))) couldn't be copied" : nil,
+                paused: model.isPaused,
+                pauseToggle: model.togglePause,
                 stop: model.stop)
         case .finished(let summary):
             CopyFinished(model: model, summary: summary)
@@ -260,12 +267,22 @@ struct CopyReady: View {
                 Spacer(minLength: 16)
             }
             LeaveOutRow(model: pack)
+            Spacer(minLength: 14)
+            CopyOptionsRow(model: model)
             Spacer(minLength: 18)
             VStack(spacing: 8) {
-                Button(model.copyButtonTitle) { model.copy() }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!model.canCopy)
+                HStack(spacing: 10) {
+                    Button(model.copyButtonTitle) { model.copy() }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!model.canCopy)
+                    if case .folder = model.existing {
+                        Button("Compare") { model.compareWithCopy() }
+                            .buttonStyle(SecondaryButtonStyle())
+                            .frame(width: 130)
+                            .help("Compare the folder with the copy that's there: what's only on one side, and what's different")
+                    }
+                }
                 if pack.source != nil && model.destination != nil {
                     Text(model.buttonNote)
                         .font(.caption)
@@ -386,6 +403,26 @@ struct CopyFinished: View {
         VStack(alignment: .leading, spacing: 14) {
             DoneHeader(title: title, detail: stats)
             HighlightRow(items: highlights)
+            if !summary.extras.isEmpty && model.trashMessage == nil {
+                HStack(spacing: 10) {
+                    Image(systemName: "trash.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(Brand.gradient)
+                    Text("\(Format.items(Int64(summary.extras.count))) in the copy aren't in the original any more.")
+                        .font(.callout)
+                    Spacer(minLength: 8)
+                    Button("Review…") { model.showingExtras = true }
+                        .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Brand.teal.opacity(0.07)))
+            }
+            if let message = model.trashMessage {
+                Label(message, systemImage: "trash")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             NotesList(notes: notes, problemCount: summary.problemCount,
                       problemText: "\(Format.items(Int64(summary.problemCount))) couldn't be copied.") {
                 model.showingProblems = true
@@ -400,6 +437,9 @@ struct CopyFinished: View {
                 Button("Show in Finder") { model.showInFinder() }
                     .buttonStyle(PrimaryButtonStyle())
                     .keyboardShortcut(.defaultAction)
+                Button("Compare") { model.compareWithCopy() }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .help("Compare the copy with the original, file by file")
                 if model.canEject && model.ejectMessage == nil {
                     Button(model.ejecting ? "Ejecting…" : "Eject “\(model.destinationDrive?.name ?? "")”") { model.eject() }
                         .buttonStyle(SecondaryButtonStyle())
@@ -435,7 +475,10 @@ struct CopyFinished: View {
             items.append(.init(value: Format.count(Int64(Double(summary.files) / copying)), label: "files a second"))
             items.append(.init(value: "\(Format.bytes(Int64(Double(summary.bytes) / copying)))/s", label: "copied"))
         }
-        if summary.unchanged > 0 {
+        if summary.verified > 0 || summary.mismatched > 0 {
+            items.append(.init(value: Format.count(summary.verified), label: summary.mismatched > 0
+                               ? "checked on the drive, \(Format.count(summary.mismatched)) didn't match" : "checked on the drive: all match"))
+        } else if summary.unchanged > 0 {
             items.append(.init(value: Format.count(summary.unchanged), label: "there already, skipped"))
         } else if !summary.plan.clone {
             items.append(.init(value: "\(summary.plan.workers)", label: "files at a time"))
@@ -451,6 +494,9 @@ struct CopyFinished: View {
         }
         if summary.rebuildable > 0 {
             notes.append("\(Format.count(summary.rebuildable)) rebuildable \(summary.rebuildable == 1 ? "folder" : "folders") (like node_modules) left out.")
+        }
+        if summary.gitIgnored > 0 {
+            notes.append("\(Format.items(summary.gitIgnored)) that Git ignores left out.")
         }
         if summary.leftOut > 0 {
             notes.append("\(Format.items(summary.leftOut)) matched Leave out, so \(summary.leftOut == 1 ? "it wasn't" : "they weren't") copied.")
@@ -468,5 +514,40 @@ struct CopyFinished: View {
             notes.append("\(Format.count(summary.changed)) \(summary.changed == 1 ? "file" : "files") changed while being copied.")
         }
         return notes
+    }
+}
+
+/// Checking the copy on the drive, and (updating) mirroring the original.
+struct CopyOptionsRow: View {
+    @ObservedObject var model: CopyModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Toggle(isOn: $model.verify) {
+                HStack(spacing: 6) {
+                    Text("Check each file on the drive")
+                        .font(.callout.weight(.semibold))
+                    Text("reads every copy back and compares it with the original (SHA-256)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .toggleStyle(.checkbox)
+            if model.isUpdating {
+                Toggle(isOn: $model.mirror) {
+                    HStack(spacing: 6) {
+                        Text("Offer to remove what's gone")
+                            .font(.callout.weight(.semibold))
+                        Text("lists what the original no longer has, to move to the Trash")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .toggleStyle(.checkbox)
+            }
+        }
+        .disabled(model.isCopying)
     }
 }

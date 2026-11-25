@@ -184,7 +184,9 @@ final class Unpacker: @unchecked Sendable {
 
     private let state = Locked(State())
     /// Batches are written one after another, each by `writers` threads.
-    private let creator = DispatchQueue(label: "OneFile.creator", qos: .userInitiated)
+    private let creator = DispatchQueue(label: "OneFile.creator", qos: Work.dispatchQoS)
+    /// Pausing waits here, between pieces of the stream and between batches of files.
+    private let gate = PauseGate()
     /// Batches handed to the creator and not yet written: one being written, one waiting.
     private let batchSlots = DispatchSemaphore(value: 2)
 
@@ -243,9 +245,13 @@ final class Unpacker: @unchecked Sendable {
         let mtime: timespec
     }
 
-    init(source: Source, destination: URL?) {
+    /// For an archive locked with a password.
+    let password: String?
+
+    init(source: Source, destination: URL?, password: String? = nil) {
         self.source = source
         self.destination = destination
+        self.password = password
         switch source {
         case .file(let url): baseName = ArchiveName.unpackedName(url.lastPathComponent)
         case .stream(_, let name): baseName = name
@@ -258,7 +264,7 @@ final class Unpacker: @unchecked Sendable {
             completion(run())
         }
         thread.name = looking ? "OneFile inspector" : "OneFile unpacker"
-        thread.qualityOfService = looking ? .utility : .userInitiated
+        thread.qualityOfService = looking ? .utility : Work.qos
         thread.start()
     }
 
@@ -269,7 +275,13 @@ final class Unpacker: @unchecked Sendable {
             return s.pipeline
         }
         pipeline?.stop()
+        gate.release()
     }
+
+    /// Pauses between pieces of the stream (and batches of files), or carries on.
+    func pause() { gate.pause() }
+    func resume() { gate.resume() }
+    var isPaused: Bool { gate.isPaused }
 
     func progress() -> Progress {
         state.withLock { $0.progress }
@@ -310,9 +322,12 @@ final class Unpacker: @unchecked Sendable {
         let pipeline: OrderedPipeline
         switch source {
         case .file(let url):
-            let name = url.lastPathComponent
-            guard let file = InputFile(path: url.path) else {
-                return .failed("Couldn't open “\(name)”: \(Packer.message(errno)).")
+            // A split file's parts are read one after another, as one; a locked one, unlocked.
+            let name = SplitParts.wholeName(url.lastPathComponent)
+            let file: InputFile
+            switch InputFile.open(url, password: password) {
+            case .success(let opened): file = opened
+            case .failure(let error): return .failed(error.message)
             }
             switch ArchiveFormat.detect(file, name: name) {
             case .failure(let error): return .failed(error.message)
@@ -342,6 +357,7 @@ final class Unpacker: @unchecked Sendable {
 
         // Work through the tar stream.
         while let result = pipeline.next() {
+            gate.wait()
             if isStopped { break }
             switch result {
             case .failure(let error):
@@ -402,6 +418,7 @@ final class Unpacker: @unchecked Sendable {
 
     private func finish(_ outcome: Outcome) -> Outcome {
         state.withLock { $0.done = true }
+        gate.release()
         return outcome
     }
 
@@ -1016,6 +1033,7 @@ final class Unpacker: @unchecked Sendable {
 
     /// Writes a batch's files, `writers` at a time. On the creator queue.
     private func write(_ batch: Batch) {
+        gate.wait()
         guard !isStopped else { return }
         let jobs = batch.jobs
         let count = jobs.count

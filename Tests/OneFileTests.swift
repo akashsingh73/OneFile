@@ -15,7 +15,7 @@ struct OneFileTests {
         if arguments.first == "--pack" {
             guard arguments.count == 3 || arguments.count == 4,
                   let method = PackMethod(rawValue: arguments.count == 4 ? arguments[3] : "plain") else {
-                print("Use: bash test.sh --pack FOLDER FILE [plain|gzip|xz]")
+                print("Use: bash test.sh --pack FOLDER FILE [plain|gzip|zstd|xz]")
                 exit(2)
             }
             exit(benchmark(arguments[1], arguments[2], method) ? 0 : 1)
@@ -43,6 +43,9 @@ struct OneFileTests {
         if arguments.first == "--inspect", arguments.count == 2 {
             exit(inspect(arguments[1]) ? 0 : 1)
         }
+        if arguments.first == "--delete", arguments.count == 2 {
+            exit(deleteBenchmark(arguments[1]) ? 0 : 1)
+        }
         if arguments.first == "--copy", arguments.count == 3 {
             exit(copyBenchmark(arguments[1], arguments[2]) ? 0 : 1)
         }
@@ -54,7 +57,7 @@ struct OneFileTests {
             let fixture = try Fixture()
             defer { fixture.remove() }
             roundTripTests(fixture, checks)
-            for method in [PackMethod.gzip, .xz] { compressedTests(fixture, method, checks) }
+            for method in [PackMethod.gzip, .zstd, .xz] { compressedTests(fixture, method, checks) }
             estimateTests(fixture, checks)
             repeatTests(fixture, checks)
             stopTests(fixture, checks)
@@ -65,6 +68,11 @@ struct OneFileTests {
             insightTests(fixture, checks)
             transferTests(fixture, checks)
             copyTests(fixture, checks)
+            featureTests(fixture, checks)
+            cliTests(fixture, checks)
+            backupTests(fixture, checks)
+            cloudTests(fixture, checks)
+            zstdTests(fixture, checks)
         } catch {
             checks.fail("Couldn't build the test folder: \(error)")
         }
@@ -138,6 +146,12 @@ struct OneFileTests {
         let folder = URL(fileURLWithPath: "/tmp/x")
         c.expect(ArchiveName.with(folder.appendingPathComponent("A.tar"), method: .xz).lastPathComponent == "A.tar.xz",
                  "swaps in the method's extension")
+        c.expect(ArchiveName.with(folder.appendingPathComponent("A.tar.gz"), method: .zstd).lastPathComponent == "A.tar.zst",
+                 "and .tar.zst for zstd")
+        c.expect(ArchiveName.split("Research.tar.zst") == ("Research", "tar.zst") && ArchiveName.split("R.tzst") == ("R", "tzst"),
+                 "splits .tar.zst and .tzst")
+        c.expect(ArchiveName.unpackedName("Research.tar.zst.age") == "Research" && ArchiveName.unpackedName("notes.txt.zst") == "notes.txt",
+                 "names what a .tar.zst and a .zst unpack to")
         c.expect(ArchiveName.numbered(folder.appendingPathComponent("A.tar.gz"), 2).lastPathComponent == "A 2.tar.gz",
                  "numbers before a double extension")
 
@@ -164,7 +178,13 @@ struct OneFileTests {
         c.expect(summary.leftOut == 4, "left out 2 .DS_Store, node_modules and a .tmp file: \(summary.leftOut)")
         let size = fileSize(tarPath)
         c.expect(summary.archiveBytes == size, "says the file is \(summary.archiveBytes) bytes; it's \(size)")
-        c.expect(size % 10_240 == 0, "padded to whole tar records")
+        c.expect(summary.tarBytes % 10_240 == 0, "the tar stream is padded to whole tar records")
+        if let file = InputFile(path: tarPath), let index = ArchiveIndex.read(file, format: .tar) {
+            c.expect(index.tarSize == summary.tarBytes && index.start == summary.tarBytes,
+                     "OneFile's index follows the end of the tar: \(index.start), \(summary.tarBytes)")
+        } else {
+            c.fail("the .tar has no index OneFile can read")
+        }
 
         let list = run("/usr/bin/tar", ["-tvf", tarPath])
         c.expect(list.status == 0 && list.errors.isEmpty, "macOS's tar lists it without complaint: \(list.errors)")
@@ -200,21 +220,30 @@ struct OneFileTests {
         c.expect(summary.archiveBytes < summary.tarBytes,
                  "smaller than the tar stream: \(summary.archiveBytes) of \(summary.tarBytes)")
         c.expect(summary.tarBytes % 10_240 == 0, "the tar stream inside is padded to whole records")
-        let tool = method == .gzip ? "/usr/bin/gzip" : "/opt/homebrew/bin/xz"
-        if FileManager.default.isExecutableFile(atPath: tool) {
+        let tool = method == .gzip ? "/usr/bin/gzip" : homebrew(method == .zstd ? "zstd" : "xz")
+        if let tool {
             let check = run(tool, ["-t", path])
             c.expect(check.status == 0, "\(tool) -t says it's sound: \(check.errors)")
         }
         let unpacked = fixture.base + "/unpacked-\(method.rawValue)"
         try? FileManager.default.createDirectory(atPath: unpacked, withIntermediateDirectories: true)
-        let extract = run("/usr/bin/tar", ["-xpf", path, "-C", unpacked])
-        c.expect(extract.status == 0 && extract.errors.isEmpty, "macOS's tar unpacks it without complaint: \(extract.errors)")
-        compare(fixture.root, unpacked + "/" + Fixture.rootName, c)
-        let python = run("/usr/bin/python3", ["-I", "-c",
-            "import sys, tarfile\nwith tarfile.open(sys.argv[1], 'r:*') as t:\n    print(len(t.getmembers()))", path])
-        if python.status == 0 {
-            let members = Int64(python.output.trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
-            c.expect(members == summary.files + summary.folders, "Python's tarfile reads \(members) entries")
+        // macOS's tar has no zstd of its own: it runs the zstd program, if it's installed.
+        let zstd = homebrew("zstd")
+        if method != .zstd || zstd != nil {
+            let environment = "PATH=" + (zstd.map { ($0 as NSString).deletingLastPathComponent + ":" } ?? "") + "/usr/bin:/bin"
+            let extract = run("/usr/bin/env", [environment, "/usr/bin/tar", "-xpf", path, "-C", unpacked])
+            c.expect(extract.status == 0 && extract.errors.isEmpty, "macOS's tar unpacks it without complaint: \(extract.errors)")
+            compare(fixture.root, unpacked + "/" + Fixture.rootName, c)
+        } else {
+            print("  (zstd isn't installed, so macOS's tar can't open it: skipped)")
+        }
+        if let python = method == .zstd ? zstdPython : "/usr/bin/python3" {
+            let read = run(python, ["-I", "-c",
+                "import sys, tarfile\nwith tarfile.open(sys.argv[1], 'r:*') as t:\n    print(len(t.getmembers()))", path])
+            if read.status == 0 || method == .zstd {
+                let members = Int64(read.output.trimmingCharacters(in: .whitespacesAndNewlines)) ?? -1
+                c.expect(members == summary.files + summary.folders, "Python's tarfile reads \(members) entries \(read.errors.prefix(200))")
+            }
         }
         fixture.cleanUp(unpacked)
 
@@ -248,11 +277,14 @@ struct OneFileTests {
         c.expect(!counted.samples.isEmpty && counted.samples.count <= 48, "sampled \(counted.samples.count) files")
         let estimates = Estimator.estimate(counted.totals, samples: counted.samples)
         let plain = estimates.bytes[.plain] ?? 0, gzip = estimates.bytes[.gzip] ?? 0, xz = estimates.bytes[.xz] ?? 0
+        let zstd = estimates.bytes[.zstd] ?? 0
         c.expect(plain == counted.totals.archiveBytes, "no compression: the tar's size")
-        c.expect(gzip > 0 && gzip < plain && xz > 0 && xz < plain, "compressed estimates are smaller: \(gzip), \(xz) of \(plain)")
+        c.expect(gzip > 0 && gzip < plain && zstd > 0 && zstd < plain && xz > 0 && xz < plain,
+                 "compressed estimates are smaller: \(gzip), \(zstd), \(xz) of \(plain)")
         c.expect((estimates.speed[.gzip] ?? 0) > (estimates.speed[.xz] ?? 0), "gzip is estimated faster than xz")
+        c.expect((estimates.speed[.zstd] ?? 0) > (estimates.speed[.gzip] ?? 0), "zstd is estimated faster than gzip")
         // The real sizes, from the packs above.
-        for method in [PackMethod.gzip, .xz] {
+        for method in [PackMethod.gzip, .zstd, .xz] {
             let real = fileSize(fixture.base + "/out/Root.\(method.fileExtension)")
             let guess = estimates.bytes[method] ?? 0
             let off = abs(Double(guess - real)) / Double(max(real, 1))
@@ -433,6 +465,26 @@ struct OneFileTests {
     static func fileSize(_ path: String) -> Int64 {
         var info = stat()
         return stat(path, &info) == 0 ? Int64(info.st_size) : -1
+    }
+
+    /// A tool Homebrew installs (zstd, pzstd, xz), if it's on this Mac.
+    static func homebrew(_ name: String) -> String? {
+        ["/opt/homebrew/bin/", "/usr/local/bin/"].map { $0 + name }.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// A Python that reads and writes zstd (3.14 or later), if there's one.
+    static let zstdPython: String? = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].first {
+        FileManager.default.isExecutableFile(atPath: $0) && run($0, ["-I", "-c", "import compression.zstd"]).status == 0
+    }
+
+    /// What OneFile reads a file packed with the method as.
+    static func format(of method: PackMethod) -> ArchiveFormat {
+        switch method {
+        case .plain: .tar
+        case .gzip: .gzip
+        case .zstd: .zstd
+        case .xz: .xz
+        }
     }
 
     static func run(_ tool: String, _ arguments: [String]) -> (status: Int32, output: String, errors: String) {

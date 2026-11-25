@@ -34,6 +34,8 @@ final class SendModel: ObservableObject {
     @Published private(set) var confirmed = false
     /// The other Mac accepted.
     @Published private(set) var otherAccepted = false
+    /// The method it's being sent with: the one chosen, unless the other Mac's OneFile is older.
+    @Published private(set) var method: PackMethod?
     @Published var address = ""
     @Published var showingAddress = false
 
@@ -132,7 +134,9 @@ final class SendModel: ObservableObject {
         finishedAt = nil
         confirmed = false
         otherAccepted = false
+        method = nil
         stage = .connecting(peer.name)
+        Work.jobStarted()
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Sending a folder to another Mac")
         AppModel.shared.activityChanged()
@@ -154,7 +158,8 @@ final class SendModel: ObservableObject {
         switch event {
         case .connecting:
             break
-        case .code(let code, let peer):
+        case .code(let code, let peer, let method):
+            self.method = method
             stage = .waiting(peer, code: code)
         case .answered:
             otherAccepted = true
@@ -191,7 +196,7 @@ final class SendModel: ObservableObject {
             remote = session.remote()
         }
         session = nil
-        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        if let activity { ProcessInfo.processInfo.endActivity(activity); Work.jobEnded() }
         activity = nil
         stage = final
         if case .finished = final { finishedAt = Date() }
@@ -263,7 +268,7 @@ final class SendModel: ObservableObject {
     }
 
     var wireText: String {
-        let method = PackModel.shared.method
+        let method = self.method ?? PackModel.shared.method
         guard progress.outputBytes > 0 else { return "Encrypted with AES-GCM · starting…" }
         var text = "\(Format.bytes(progress.outputBytes)) sent, encrypted"
         if method != .plain, progress.processed > 0 {

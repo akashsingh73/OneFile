@@ -5,13 +5,15 @@ import zlib
 /// Compresses the tar stream as it's written, on every core.
 ///
 /// The stream is cut into blocks (`PackMethod.blockSize`), each compressed on its own into a
-/// complete gzip member or xz stream, and written in order. Both formats allow several of these
-/// one after another in a file, and every reader (macOS's tar, gzip and Archive Utility, xz,
-/// Python, 7-Zip) reads them back as one stream. It's how `pigz` and `xz -T0` work too.
+/// complete gzip member, zstd frame or xz stream, and written in order. All three formats allow
+/// several of these one after another in a file, and every reader (macOS's tar, gzip and Archive
+/// Utility, zstd, xz, Python, 7-Zip) reads them back as one stream. It's how `pigz`, `pzstd` and
+/// `xz -T0` work too.
 ///
 /// Each gzip member also says, in a field of its header that other readers skip, how long it is
-/// and how much it holds: OneFile unpacks its own .tar.gz files on every core with that (see
-/// `ArchiveDecoder`). For a stream to another Mac, `frame` encrypts each block as well.
+/// and how much it holds, and so does each zstd frame (see `Zstd`): OneFile unpacks its own files
+/// on every core with that (see `ArchiveDecoder`). For a stream to another Mac, `frame` encrypts
+/// each block as well.
 final class BlockCompressor: @unchecked Sendable {
     private let method: PackMethod
     private let blockSize: Int
@@ -29,7 +31,7 @@ final class BlockCompressor: @unchecked Sendable {
     /// Blocks handed out and not yet written; waiting for one keeps memory bounded.
     private let slots: DispatchSemaphore
     private let group = DispatchGroup()
-    private let workers = DispatchQueue(label: "OneFile.compress", qos: .userInitiated, attributes: .concurrent)
+    private let workers = DispatchQueue(label: "OneFile.compress", qos: Work.dispatchQoS, attributes: .concurrent)
 
     // Shared between compression threads, behind the lock.
     private let lock = NSLock()
@@ -142,6 +144,7 @@ final class BlockCompressor: @unchecked Sendable {
         switch method {
         case .plain: Data(bytes: input, count: count)
         case .gzip: gzipMember(input, count, level: 1)
+        case .zstd: Zstd.block(input, count)
         case .xz: xzStream(input, count)
         }
     }

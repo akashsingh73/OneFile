@@ -1,7 +1,6 @@
 # Roadmap
 
-What's planned next. For now OneFile works between Macs and the drives connected to them; these
-take it further.
+What's planned next.
 
 ## Send to and from phones, tablets and other computers
 
@@ -35,3 +34,20 @@ network, with nothing to install on it.
 - **"Waiting for the drive."** When a drive is too busy to answer (another app deleting or uploading
   on it, Spotlight indexing it), packing and copying can look stuck. The progress should say it's
   waiting for the drive.
+- **Google Drive without a client of your own.** Signing in to Google Drive needs a Google Cloud
+  client; OneFile can't ship one in a public repository. A verified client would let anyone sign in
+  with a click.
+
+## Done
+
+- **zstd**: a fourth method, Efficient (`.tar.zst`): smaller than Balanced and quicker, on every
+  core, from zstd's own library.
+- **Command line**: the `onefile` command, for everything the app does.
+- **Back up when a drive is plugged in**, even when OneFile isn't open.
+- **The cloud**: pack to S3-compatible storage and Google Drive as it packs; unpack, look inside and
+  take files out straight from the cloud or any link; share links.
+- **OneFile's index**: look inside at once, take out one file, check every file's SHA-256.
+- **Lock with a password** (age), **split into parts**, **leave out what Git ignores**.
+- **Verify copies, mirror, compare folders.**
+- **Drives**: speed with many small files, deleting fast.
+- **Work gently, pause on battery**, and links for Shortcuts (`onefile://`).

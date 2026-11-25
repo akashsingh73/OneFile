@@ -105,12 +105,13 @@ struct Drive: Sendable, Equatable, Identifiable {
         var drives: [Drive] = []
         var seen = Set<UInt64>()
         for url in urls {
-            guard let drive = of(url.path), seen.insert(drive.device).inserted else { continue }
-            // The read-only system volume isn't anywhere to copy to; its data volume is.
+            // The read-only system volume isn't anywhere to copy to; its data volume is (macOS
+            // gives the two the same device number).
             if url.path == "/" {
                 if let data = of("/System/Volumes/Data"), seen.insert(data.device).inserted { drives.append(data) }
                 continue
             }
+            guard let drive = of(url.path), seen.insert(drive.device).inserted else { continue }
             drives.append(drive)
         }
         return drives.sorted { ($0.isStartup ? 0 : 1, $0.name) < ($1.isStartup ? 0 : 1, $1.name) }
@@ -248,6 +249,39 @@ struct Drive: Sendable, Equatable, Identifiable {
         case "webdav": "WebDAV"
         default: "Network"
         }
+    }
+}
+
+/// Folders a cloud service keeps in sync (Google Drive, iCloud Drive, Dropbox, OneDrive, Box):
+/// every file put in one is uploaded on its own, which for many small files takes hours.
+enum CloudSync {
+    /// The service that syncs the folder at `path`, if one does.
+    static func service(for path: String) -> String? {
+        let real = Copier.realPath(path)
+        let home = Copier.realPath(NSHomeDirectory())
+        // Services that use macOS's File Provider keep their folders here, one per account:
+        // "GoogleDrive-name@example.com", "OneDrive-Personal", "Dropbox", "Box-Box".
+        let storage = home + "/Library/CloudStorage/"
+        if real.hasPrefix(storage) {
+            let folder = real.dropFirst(storage.count).prefix { $0 != "/" }
+            let provider = folder.prefix { $0 != "-" }
+            switch provider {
+            case "GoogleDrive": return "Google Drive"
+            case "OneDrive": return "OneDrive"
+            case "Dropbox": return "Dropbox"
+            case "Box": return "Box"
+            case "": return nil
+            default: return String(provider)
+            }
+        }
+        if real.hasPrefix(home + "/Library/Mobile Documents/") { return "iCloud Drive" }
+        if real == home + "/Dropbox" || real.hasPrefix(home + "/Dropbox/") { return "Dropbox" }
+        // Desktop and Documents, when iCloud keeps them.
+        if let values = try? URL(fileURLWithPath: real).resourceValues(forKeys: [.isUbiquitousItemKey]),
+           values.isUbiquitousItem == true {
+            return "iCloud Drive"
+        }
+        return nil
     }
 }
 

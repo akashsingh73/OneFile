@@ -42,6 +42,9 @@ enum Wire {
         var name: String
         var kind: String
         var key: Data
+        /// The methods the receiver unpacks (`PackMethod`'s raw values). Missing from OneFiles
+        /// before 3.0, which unpack all but zstd.
+        var methods: [String]?
     }
 
     struct Reveal: Codable, Sendable {
@@ -215,6 +218,12 @@ struct Handshake: Sendable {
     let code: String
     let peerName: String
     let peerKind: String
+    /// For the sender: the methods the receiver unpacks.
+    var peerMethods: [PackMethod] = [.plain, .gzip, .xz]
+
+    /// The methods this OneFile unpacks, as it tells senders. (The tests play an older OneFile by
+    /// changing it.)
+    nonisolated(unsafe) static var unpacks = PackMethod.allCases
 }
 
 enum HandshakeError: Error {
@@ -240,7 +249,11 @@ extension Handshake {
         let reveal = Wire.encode(Wire.Reveal(key: mine))
         guard link.send(Wire.frame(.reveal, reveal)) else { return .failure(.failed(link.failure ?? lost)) }
         return derive(key, theirs: welcome.key, transcript: hello + welcomeBytes + reveal, sender: true,
-                      peerName: welcome.name, peerKind: welcome.kind)
+                      peerName: welcome.name, peerKind: welcome.kind).map { handshake in
+            var handshake = handshake
+            if let methods = welcome.methods { handshake.peerMethods = methods.compactMap { PackMethod(rawValue: $0) } }
+            return handshake
+        }
     }
 
     static func asReceiver(_ link: Link, me: ThisMac.Identity) -> Result<Handshake, HandshakeError> {
@@ -253,7 +266,8 @@ extension Handshake {
         }
         let key = Curve25519.KeyAgreement.PrivateKey()
         let welcome = Wire.encode(Wire.Welcome(version: Wire.version, name: me.name, kind: me.kind,
-                                               key: key.publicKey.rawRepresentation))
+                                               key: key.publicKey.rawRepresentation,
+                                               methods: unpacks.map(\.rawValue)))
         guard link.send(Wire.frame(.welcome, welcome)) else { return .failure(.failed(link.failure ?? lost)) }
         guard let (next, revealBytes) = link.readFrame(), next == .reveal,
               let reveal = Wire.decode(Wire.Reveal.self, revealBytes) else {
@@ -445,8 +459,9 @@ final class Link: @unchecked Sendable {
 final class SendSession: PackStream, @unchecked Sendable {
     enum Event: Sendable {
         case connecting
-        /// Connected: the code both Macs show, while waiting for both sides to confirm it.
-        case code(String, peer: String)
+        /// Connected: the code both Macs show, while waiting for both sides to confirm it, and the
+        /// method it goes with.
+        case code(String, peer: String, method: PackMethod)
         /// The other Mac accepted; it's waiting for the person here to confirm the code.
         case answered
         case accepted
@@ -568,7 +583,10 @@ final class SendSession: PackStream, @unchecked Sendable {
         }
         let sealer = handshake.sealer
         state.withLock { $0.sealer = sealer }
-        onEvent(.code(handshake.code, peer: handshake.peerName))
+        // An older OneFile on the other Mac can't unpack zstd: it goes as Balanced.
+        var options = self.options
+        if !handshake.peerMethods.contains(options.method) { options.method = .gzip }
+        onEvent(.code(handshake.code, peer: handshake.peerName, method: options.method))
 
         // Listen for the answer, the other Mac's progress, and its result.
         let reader = Thread { [self] in read(link, sealer) }

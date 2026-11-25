@@ -13,6 +13,9 @@ struct OneFileApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
         .commands { OneFileCommands(app: app) }
+        Settings {
+            SettingsView(model: .shared)
+        }
     }
 }
 
@@ -31,6 +34,10 @@ struct OneFileCommands: Commands {
                 UnpackModel.shared.chooseArchive()
             }
             .keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Compare Two Folders…") {
+                CompareModel.shared.chooseAndCompare()
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
             Divider()
             Button(goTitle) { go() }
                 .keyboardShortcut(.return, modifiers: .command)
@@ -53,6 +60,7 @@ struct OneFileCommands: Commands {
         case .copy: "Copy"
         case .send: "Send"
         case .receive: "Accept"
+        case .drives: "Test Speed"
         }
     }
 
@@ -62,6 +70,7 @@ struct OneFileCommands: Commands {
         case .pack: PackModel.shared.pack()
         case .unpack: UnpackModel.shared.unpack()
         case .copy: CopyModel.shared.copy()
+        case .drives: DrivesModel.shared.testSpeed()
         case .send: SendModel.shared.send()
         case .receive: ReceiveModel.shared.accept()
         }
@@ -73,6 +82,9 @@ struct OneFileCommands: Commands {
         case .pack: PackModel.shared.stop()
         case .unpack: UnpackModel.shared.stop()
         case .copy: CopyModel.shared.stop()
+        case .drives:
+            DrivesModel.shared.stopTest()
+            DrivesModel.shared.cancelDelete()
         case .send: SendModel.shared.stop()
         case .receive: ReceiveModel.shared.stop()
         }

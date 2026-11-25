@@ -22,12 +22,13 @@ struct Estimates: Sendable {
 
 enum Estimator {
     /// Tar's header blocks and padding compress to next to nothing; these are typical.
-    private static let overhead: [PackMethod: Double] = [.plain: 1, .gzip: 0.08, .xz: 0.05]
+    private static let overhead: [PackMethod: Double] = [.plain: 1, .gzip: 0.08, .zstd: 0.06, .xz: 0.05]
     /// Compressing on every core isn't every-core-times faster: the cores share memory, and xz's
     /// big dictionaries crowd it. Measured on an M4 Max (16 cores), packing 2.1 GB: gzip ran at 0.9
-    /// of one core's speed times the cores, xz at 0.4. The sample's own pieces (smaller, and fewer
-    /// at once) run faster than that.
-    private static let parallelShare: [PackMethod: Double] = [.gzip: 0.9, .xz: 0.4]
+    /// of one core's speed times the cores, xz at 0.4. zstd, compressing tars of 290 and 550 MB in
+    /// its 8 MB pieces, ran at 0.75 and 0.9. The sample's own pieces (smaller, and fewer at once)
+    /// run faster than that.
+    private static let parallelShare: [PackMethod: Double] = [.gzip: 0.9, .zstd: 0.8, .xz: 0.4]
 
     /// Compresses about 12 MB read from the sampled files each way, several pieces at once, and
     /// scales up. Takes well under a second.
@@ -58,7 +59,7 @@ enum Estimator {
 
         var bytes: [PackMethod: Int64] = [.plain: totals.archiveBytes]
         var speed: [PackMethod: Double] = [:]
-        for method in [PackMethod.gzip, .xz] {
+        for method in [PackMethod.gzip, .zstd, .xz] {
             if groups.isEmpty {
                 // Next to no data: it's nearly all headers.
                 bytes[method] = Int64(headers * overhead[method, default: 1]) + 1_024
@@ -69,7 +70,7 @@ enum Estimator {
             for group in groups {
                 // Every method compresses the same bytes: a part of the sample could be all video
                 // and another all text.
-                let result = measure(group.sample, method, piece: method == .xz ? 2 << 20 : 1 << 20, limit: 6 << 20)
+                let result = measure(group.sample, method, piece: method == .gzip ? 1 << 20 : 2 << 20, limit: 6 << 20)
                 data += group.bytes * min(result.ratio * group.bias, 1.01)
                 sampled += result.sampled
                 seconds += result.seconds

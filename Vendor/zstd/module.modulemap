@@ -1,0 +1,7 @@
+// zstd's library, for Swift: `import CZstd`. build.sh and test.sh add this folder with -I, and link
+// the library Tools/zstd.sh compiles.
+module CZstd [system] [extern_c] {
+    header "lib/zstd.h"
+    header "lib/zstd_errors.h"
+    export *
+}

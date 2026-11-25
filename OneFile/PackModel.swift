@@ -71,6 +71,27 @@ final class PackModel: ObservableObject {
     @Published private(set) var estimates: Estimates?
     /// Kinds of rebuildable folders being left out (`Rebuildable` rule ids).
     @Published private(set) var skipRebuildable: Set<Int16>
+    /// Split the packed file into parts of this many bytes; nil for one file.
+    @Published private(set) var splitSize: Int64?
+    /// The folder is in a Git project: what Git ignores can be left out.
+    @Published private(set) var gitIgnored: [String]?
+    /// Lock the packed file with a password (the age format). The password is never kept.
+    @Published var locking = false {
+        didSet {
+            guard locking != oldValue else { return }
+            if let source, case .ready = stage { destination = defaultDestination(for: source) }
+        }
+    }
+    @Published var password = ""
+    @Published var passwordAgain = ""
+    /// Leave out what Git ignores (when the folder is in a Git project).
+    @Published var respectGitignore: Bool {
+        didSet {
+            guard respectGitignore != oldValue else { return }
+            UserDefaults.standard.set(respectGitignore, forKey: Self.gitignoreKey)
+            if gitIgnored != nil { startCount() }
+        }
+    }
 
     /// The folder picked in the Save panel, kept for the next folder packed.
     private var chosenFolder: URL?
@@ -81,11 +102,15 @@ final class PackModel: ObservableObject {
     /// The person picked a method; until then, OneFile follows its recommendation.
     private var methodChosen: Bool
     private var packer: Packer?
+    /// Packing to the cloud: packing and sending at once.
+    private var upload: CloudPack?
+    private var stopRequested = false
     private var timer: Timer?
     private var activity: NSObjectProtocol?
     private var countFlag: StopFlag?
     private var countedRules: [String] = []
     private var countedSkips: Set<Int16> = []
+    private var countedExcluded: Set<String> = []
     private var recount: Task<Void, Never>?
     /// How big each rebuildable kind was the last time it was counted in, for when it's left out.
     private var knownRebuildable: [Int16: RebuildableTotals] = [:]
@@ -93,6 +118,8 @@ final class PackModel: ObservableObject {
     private static let leaveOutKey = "leaveOut"
     private static let methodKey = "method"
     private static let rebuildableKey = "skipRebuildable"
+    private static let splitKey = "splitSize"
+    private static let gitignoreKey = "respectGitignore"
 
     init() {
         let defaults = UserDefaults.standard
@@ -101,6 +128,35 @@ final class PackModel: ObservableObject {
         method = saved ?? .plain
         methodChosen = saved != nil
         skipRebuildable = Set((defaults.array(forKey: Self.rebuildableKey) as? [Int] ?? []).map(Int16.init))
+        let split = Int64(defaults.integer(forKey: Self.splitKey))
+        splitSize = split > 0 ? split : nil
+        respectGitignore = defaults.bool(forKey: Self.gitignoreKey)
+    }
+
+    /// The paths to leave out because Git ignores them (when that's asked for).
+    var excludedPaths: Set<String> {
+        respectGitignore ? Set(gitIgnored ?? []) : []
+    }
+
+    func setSplit(_ size: Int64?) {
+        guard !isLocked, size != splitSize else { return }
+        splitSize = size
+        UserDefaults.standard.set(size ?? 0, forKey: Self.splitKey)
+    }
+
+    /// Asks Git, in the background, what it ignores in the folder.
+    private func lookForGit(_ folder: URL) {
+        gitIgnored = nil
+        let path = folder.path
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ignored = GitIgnore.ignored(in: path)
+            onMain {
+                let model = PackModel.shared
+                guard model.source?.path == path else { return }
+                model.gitIgnored = ignored
+                if ignored != nil && model.respectGitignore { model.startCount() }
+            }
+        }
     }
 
     /// Replacing an existing file is fine only if it's the one confirmed in the Save panel.
@@ -115,17 +171,32 @@ final class PackModel: ObservableObject {
     var isLocked: Bool { isPacking || SendModel.shared.isBusy || CopyModel.shared.isCopying }
 
     var canPack: Bool {
-        source != nil && destination != nil && !isLocked && !warningStopsPacking
+        guard source != nil, !isLocked, !locking || (!password.isEmpty && password == passwordAgain) else { return false }
+        return cloud != nil || (destination != nil && !warningStopsPacking)
     }
 
     /// The options packing (or sending) uses.
     var options: Packer.Options {
-        Packer.Options(leaveOut: WalkRules.parse(leaveOut), method: method, skipRebuildable: skipRebuildable)
+        Packer.Options(leaveOut: WalkRules.parse(leaveOut), method: method, skipRebuildable: skipRebuildable,
+                       excluded: excludedPaths, splitSize: splitSize, password: locking ? password : nil)
+    }
+
+    /// The packed file's extension: the method's, and ".age" when it's locked.
+    var fileExtension: String { method.fileExtension + (locking ? ".age" : "") }
+
+    /// Why the password can't be used yet, if it can't.
+    var passwordProblem: String? {
+        guard locking else { return nil }
+        if password.isEmpty { return "Type a password, twice." }
+        if password != passwordAgain { return passwordAgain.isEmpty ? "Type it again, to be sure." : "The two don't match." }
+        if password.count < 8 { return "Longer is safer: 8 characters or more." }
+        return nil
     }
 
     /// The counted totals, if they're for the options in use now.
     var knownTotals: Packer.Totals? {
-        if case .counted(let totals) = count, countedRules == WalkRules.parse(leaveOut), countedSkips == skipRebuildable {
+        if case .counted(let totals) = count, countedRules == WalkRules.parse(leaveOut), countedSkips == skipRebuildable,
+           countedExcluded == excludedPaths {
             return totals
         }
         return nil
@@ -166,16 +237,18 @@ final class PackModel: ObservableObject {
         destination = defaultDestination(for: folder)
         refreshRoom()
         startCount()
+        lookForGit(folder)
         return true
     }
 
     func chooseDestination() {
         guard !isLocked, let source else { return }
+        cloud = nil
         let panel = NSSavePanel()
         panel.title = "Save the Packed File"
         panel.prompt = "Choose"
         panel.message = "Choose where to save the one file. An external drive is fine."
-        panel.nameFieldStringValue = destination?.lastPathComponent ?? source.lastPathComponent + "." + method.fileExtension
+        panel.nameFieldStringValue = destination?.lastPathComponent ?? source.lastPathComponent + "." + fileExtension
         panel.directoryURL = destination?.deletingLastPathComponent()
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
@@ -184,15 +257,30 @@ final class PackModel: ObservableObject {
         chosenName = ArchiveName.split(url.lastPathComponent).base
         // The extension always matches the method. If that changed the name, the Save panel's
         // question about replacing was about another file, so this one isn't replaced.
-        let fixed = ArchiveName.with(url, method: method)
+        var fixed = ArchiveName.with(url, method: method)
+        if locking { fixed = fixed.deletingLastPathComponent().appendingPathComponent(fixed.lastPathComponent + ".age") }
         confirmedDestination = fixed == url ? url : nil
         destination = defaultDestination(for: source)
+        refreshRoom()
+    }
+
+    /// Saves the packed file as `url` (from a link): in that folder, under that name (the extension
+    /// follows the method). Never replaces a file: a name that's taken gets a number.
+    func saveAs(_ url: URL) {
+        guard !isLocked else { return }
+        cloud = nil
+        chosenFolder = url.deletingLastPathComponent()
+        chosenName = ArchiveName.split(url.lastPathComponent).base
+        confirmedDestination = nil
+        if let source { destination = defaultDestination(for: source) }
+        stage = .ready
         refreshRoom()
     }
 
     /// Saves the packed file in `folder` (Copy's destination, when packing is the faster way there).
     func saveIn(_ folder: URL) {
         guard !isLocked else { return }
+        cloud = nil
         chosenFolder = folder
         confirmedDestination = nil
         if let source { destination = defaultDestination(for: source) }
@@ -209,7 +297,7 @@ final class PackModel: ObservableObject {
             folder = fm.urls(for: .desktopDirectory, in: .userDomainMask).first
                 ?? URL(fileURLWithPath: NSHomeDirectory())
         }
-        let first = folder.appendingPathComponent((chosenName ?? source.lastPathComponent) + "." + method.fileExtension)
+        let first = folder.appendingPathComponent((chosenName ?? source.lastPathComponent) + "." + fileExtension)
         if first == confirmedDestination { return first }
         var candidate = first
         var number = 2
@@ -268,8 +356,10 @@ final class PackModel: ObservableObject {
         countFlag = flag
         let rules = WalkRules.parse(leaveOut)
         let skips = skipRebuildable
+        let excluded = excludedPaths
         countedRules = rules
         countedSkips = skips
+        countedExcluded = excluded
         count = .counting(Packer.Totals())
         estimates = nil
         DispatchQueue.global(qos: .userInitiated).async {
@@ -279,8 +369,9 @@ final class PackModel: ObservableObject {
                 onMain { PackModel.shared.counted(.failed(message), insights: nil, flag: flag) }
             case .success(let root):
                 var lastReport = DispatchTime.now().uptimeNanoseconds
-                let result = Packer.count(root, rules: WalkRules(leaveOut: rules, device: root.entry.device,
-                                                                 skipRebuildable: skips),
+                var walkRules = WalkRules(leaveOut: rules, device: root.entry.device, skipRebuildable: skips)
+                walkRules.excluded = excluded
+                let result = Packer.count(root, rules: walkRules,
                                           stopped: { flag.isSet }, progress: { partial in
                     let now = DispatchTime.now().uptimeNanoseconds
                     guard now - lastReport > 150_000_000 else { return }
@@ -320,7 +411,12 @@ final class PackModel: ObservableObject {
     // MARK: Packing
 
     func pack() {
-        guard canPack, let source, let destination else { return }
+        guard canPack, let source else { return }
+        if let cloud {
+            packToCloud(cloud, source)
+            return
+        }
+        guard let destination else { return }
         let known = knownTotals
         // If counting isn't done, the packer counts for itself, alongside the packing.
         if known == nil { countFlag?.set() }
@@ -332,6 +428,7 @@ final class PackModel: ObservableObject {
         meter.reset()
         finishedAt = nil
         stage = .packing
+        Work.jobStarted()
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Packing a folder into one file")
         let timer = Timer(timeInterval: 0.15, repeats: true) { _ in
@@ -347,16 +444,195 @@ final class PackModel: ObservableObject {
 
     func stop() {
         packer?.cancel()
+        upload?.cancel()
+        stopRequested = true
+    }
+
+
+    // MARK: Packing to the cloud
+
+    /// Packing goes to this account instead of a file: sent as it's packed.
+    @Published private(set) var cloud: CloudAccount?
+    /// Sent so far, and whether packing's done (the rest is being sent).
+    @Published private(set) var sent: Int64 = 0
+    @Published private(set) var sending = false
+    /// What was sent, and where, for a link to it.
+    @Published private(set) var sentItem: CloudItem?
+    @Published private(set) var sentLink: String?
+    @Published private(set) var linkProblem: String?
+    @Published private(set) var makingLink = false
+    private var sentPlace: CloudPlace?
+
+    func packToCloud(_ account: CloudAccount) {
+        guard !isLocked else { return }
+        cloud = account
+        if splitSize != nil { setSplit(nil) }
+        stage = .ready
+    }
+
+    /// The archive's name in the cloud.
+    var cloudName: String {
+        (chosenName ?? source?.lastPathComponent ?? "Archive") + "." + fileExtension
+    }
+
+    private func packToCloud(_ account: CloudAccount, _ source: URL) {
+        var unsplit = self.options
+        unsplit.splitSize = nil
+        let options = unsplit
+        let name = cloudName
+        stopRequested = false
+        progress = Packer.Progress()
+        sent = 0
+        sending = false
+        sentItem = nil
+        sentLink = nil
+        linkProblem = nil
+        meter.reset()
+        finishedAt = nil
+        stage = .packing
+        Work.jobStarted()
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled], reason: "Packing a folder to the cloud")
+        let timer = Timer(timeInterval: 0.15, repeats: true) { _ in
+            MainActor.assumeIsolated { PackModel.shared.tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        AppModel.shared.activityChanged()
+        DispatchQueue.global(qos: .userInitiated).async {
+            switch Cloud.connect(account) {
+            case .failure(let error):
+                onMain { PackModel.shared.cloudFinished(.failed(error.message), place: nil) }
+            case .success(let place):
+                onMain {
+                    let model = PackModel.shared
+                    guard !model.stopRequested else {
+                        model.cloudFinished(.stopped, place: nil)
+                        return
+                    }
+                    let upload = CloudPack(source: source, target: place.target(name), options: options)
+                    model.upload = upload
+                    model.sentPlace = place
+                    upload.start { outcome in
+                        onMain { PackModel.shared.cloudFinished(outcome, place: place) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func cloudFinished(_ outcome: CloudPack.Outcome, place: CloudPlace?) {
+        timer?.invalidate()
+        timer = nil
+        if let upload {
+            let state = upload.progress()
+            progress = state.packing
+            sent = state.sent
+        }
+        upload = nil
+        isPaused = false
+        pausedForBattery = false
+        if let activity { ProcessInfo.processInfo.endActivity(activity); Work.jobEnded() }
+        activity = nil
+        password = ""
+        passwordAgain = ""
+        switch outcome {
+        case .finished(let summary, let item):
+            sentItem = item
+            sentPlace = place
+            stage = .finished(summary)
+            finishedAt = Date()
+        case .stopped: stage = .stopped
+        case .failed(let message): stage = .failed(message)
+        }
+        AppModel.shared.activityChanged()
+        if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
+    }
+
+    /// Copies a link to what was sent: signed for 7 days at an S3 service, shared with anyone who
+    /// has it in Google Drive.
+    func copyLink() {
+        guard let item = sentItem, let place = sentPlace, !makingLink else { return }
+        makingLink = true
+        linkProblem = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Cloud.link(item, in: place)
+            onMain {
+                let model = PackModel.shared
+                model.makingLink = false
+                switch result {
+                case .success(let url):
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                    model.sentLink = url.absoluteString
+                case .failure(let error):
+                    model.linkProblem = error.message
+                }
+            }
+        }
+    }
+
+    var linkNote: String {
+        if case .drive = sentPlace { return "Copied. Anyone with the link can download it." }
+        return "Copied. Anyone with the link can download it for 7 days."
+    }
+
+    // MARK: Pausing
+
+    @Published private(set) var isPaused = false
+    /// Paused because the Mac went onto its battery: it carries on when it's back on power.
+    private(set) var pausedForBattery = false
+
+    func togglePause() {
+        if isPaused {
+            packer?.resume()
+            upload?.resume()
+            isPaused = false
+            pausedForBattery = false
+        } else if packer != nil || upload != nil {
+            packer?.pause()
+            upload?.pause()
+            isPaused = true
+        }
+    }
+
+    func pauseForBattery() {
+        guard packer != nil || upload != nil, !isPaused else { return }
+        packer?.pause()
+        upload?.pause()
+        isPaused = true
+        pausedForBattery = true
+    }
+
+    func resumeAfterBattery() {
+        guard pausedForBattery else { return }
+        packer?.resume()
+        upload?.resume()
+        isPaused = false
+        pausedForBattery = false
+    }
+
+    var pausedText: String {
+        pausedForBattery ? "Paused while the Mac is on its battery" : "Paused"
     }
 
     /// Quitting: stops, and deletes the unfinished file right away.
     func stopForQuit() {
+        upload?.cancel()
         guard let packer else { return }
         packer.cancel()
-        if let part = packer.partPath { unlink(part) }
+        for part in packer.partPaths { unlink(part) }
     }
 
     private func tick() {
+        if let upload {
+            let state = upload.progress()
+            progress = state.packing
+            sent = state.sent
+            sending = state.packed
+            meter.add(bytes: progress.processed, files: progress.files)
+            return
+        }
         guard let packer else { return }
         progress = packer.progress()
         meter.add(bytes: progress.processed, files: progress.files)
@@ -367,14 +643,20 @@ final class PackModel: ObservableObject {
         timer = nil
         if let packer { progress = packer.progress() }
         packer = nil
+        isPaused = false
+        pausedForBattery = false
         // Packing started before counting finished, so the packer counted: show its count.
         if case .counted = count {} else if let totals = progress.totals {
             count = .counted(totals)
             countedRules = WalkRules.parse(leaveOut)
             countedSkips = skipRebuildable
+            countedExcluded = excludedPaths
         }
-        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        if let activity { ProcessInfo.processInfo.endActivity(activity); Work.jobEnded() }
         activity = nil
+        // The password isn't kept.
+        password = ""
+        passwordAgain = ""
         switch outcome {
         case .finished(let summary):
             stage = .finished(summary)
@@ -389,6 +671,9 @@ final class PackModel: ObservableObject {
     /// Back to the start, with the same folder, ready to pack it again or pick another.
     func done() {
         stage = .ready
+        sentItem = nil
+        sentLink = nil
+        linkProblem = nil
         confirmedDestination = nil
         if let source { destination = defaultDestination(for: source) }
         refreshRoom()
@@ -396,7 +681,13 @@ final class PackModel: ObservableObject {
 
     func showInFinder() {
         guard case .finished(let summary) = stage, let output = summary.output else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([output])
+        NSWorkspace.shared.activateFileViewerSelecting(summary.parts.isEmpty ? [output] : summary.parts)
+    }
+
+    /// How many parts the file will be in (when it's split, and its size is known).
+    var expectedParts: Int? {
+        guard let splitSize, let size = expectedSize(method), size > splitSize else { return nil }
+        return Int((size + splitSize - 1) / splitSize)
     }
 
     func copyProblems() {
@@ -512,12 +803,14 @@ final class PackModel: ObservableObject {
     var shownDestination: URL? { summary?.output ?? destination }
 
     var destinationSizeText: String? {
-        if let summary { return Format.bytes(summary.archiveBytes) }
+        if let summary {
+            return Format.bytes(summary.archiveBytes) + (summary.parts.count > 1 ? " in \(summary.parts.count) parts" : "")
+        }
         guard let size = expectedSize(method) else {
             if case .counted = count { return "Estimating the size…" }
             return nil
         }
-        return "About \(Format.bytes(size))"
+        return "About \(Format.bytes(size))" + (expectedParts.map { " in \($0) parts" } ?? "")
     }
 
     /// The file's size for `method`: exact enough for no compression, an estimate otherwise.
@@ -535,8 +828,8 @@ final class PackModel: ObservableObject {
     var destinationWarning: String? {
         guard let room, summary == nil, let size = expectedSize(method) else { return nil }
         let maybe = method == .plain ? "" : "May not fit: "
-        if room.isFAT && size >= 4 << 30 {
-            return maybe + "this drive is FAT32, which can't hold a file of 4 GB or more. Pick another place, or format it as exFAT."
+        if room.isFAT && size >= 4 << 30 && (splitSize ?? size) >= 4 << 30 {
+            return maybe + "this drive is FAT32, which can't hold a file of 4 GB or more. Split it into 4 GB parts (below), pick another place, or format the drive as exFAT."
         }
         if let free = room.free, size > free {
             return maybe + "it needs about \(Format.bytes(size)), and \(Format.bytes(free)) is free here."
@@ -584,8 +877,15 @@ final class PackModel: ObservableObject {
 
     /// How far along, once the folder has been counted.
     var fraction: Double? {
+        if cloud != nil && sending && progress.outputBytes > 0 { return min(1, Double(sent) / Double(progress.outputBytes)) }
         guard let totals = progress.totals, totals.archiveBytes > 0 else { return nil }
         return min(1, Double(progress.processed) / Double(totals.archiveBytes))
+    }
+
+    /// Sent to the cloud, of what's packed so far.
+    var sentFraction: Double? {
+        guard progress.outputBytes > 0 else { return nil }
+        return min(1, Double(sent) / Double(progress.outputBytes))
     }
 
     /// How much of the folder has been read into the tar stream (ahead of `fraction` while
@@ -601,6 +901,7 @@ final class PackModel: ObservableObject {
     }
 
     var etaText: String {
+        if isPaused { return pausedText }
         if progress.finishing { return "Saving to the disk…" }
         guard let totals = progress.totals else { return "Counting what's left…" }
         guard let fraction, fraction > 0.01, meter.bytesPerSecond > 0 else { return "Working out the time left…" }
@@ -619,6 +920,12 @@ final class PackModel: ObservableObject {
 
     /// The file being written, and how big it is so far.
     var outputText: String {
+        if let cloud {
+            let name = cloudName
+            guard progress.outputBytes > 0 else { return "\(name) · connecting to “\(cloud.name)”…" }
+            return "\(name) · \(Format.bytes(sent)) of \(Format.bytes(progress.outputBytes)) sent to “\(cloud.name)”"
+                + (sending ? ", packed" : "")
+        }
         let name = destination?.lastPathComponent ?? ""
         guard progress.outputBytes > 0 else {
             return method == .plain ? "\(name) · starting…" : "\(name) · compressing the first pieces…"

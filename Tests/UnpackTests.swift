@@ -19,9 +19,9 @@ extension OneFileTests {
             try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
             guard case .finished(let summary) = unpack(archive, into: folder, c) else { continue }
             c.expect(summary.output?.path == folder + "/" + Fixture.rootName, "unpacked as \(summary.output?.path ?? "nothing")")
-            c.expect(summary.format == (method == .plain ? .tar : method == .gzip ? .gzip : .xz), "read as \(String(describing: summary.format))")
-            if method == .gzip {
-                c.expect(summary.parallel, "OneFile's own .tar.gz decompresses on every core")
+            c.expect(summary.format == format(of: method), "read as \(String(describing: summary.format))")
+            if method == .gzip || method == .zstd {
+                c.expect(summary.parallel, "OneFile's own .\(method.fileExtension) decompresses on every core")
             }
             let leftovers = (try? FileManager.default.contentsOfDirectory(atPath: folder))?.filter { $0.contains("unpacking") } ?? []
             c.expect(leftovers.isEmpty, "no “(unpacking)” folder left: \(leftovers)")
@@ -56,7 +56,7 @@ extension OneFileTests {
     // MARK: - Other tools' files
 
     static func foreignTests(_ fixture: Fixture, _ c: Checks) {
-        c.section("Unpacking files made by other tools (macOS's tar, gzip, xz, Python)")
+        c.section("Unpacking files made by other tools (macOS's tar, gzip, xz, zstd, Python)")
         // A clean copy of the test folder (nothing unreadable), as OneFile unpacks it.
         let clean = fixture.base + "/clean"
         try? FileManager.default.createDirectory(atPath: clean, withIntermediateDirectories: true)
@@ -83,6 +83,27 @@ extension OneFileTests {
             if run("/bin/sh", ["-c", "\"$2\" -T0 --block-size=65536 -c \"$0\" > \"$1\"", made + "/bsdtar.tar", made + "/xz-blocks.tar.xz", xz]).status == 0 {
                 archives.append(("xz -T0, many blocks", made + "/xz-blocks.tar.xz"))
             }
+        }
+        if let zstd = homebrew("zstd") {
+            if run("/bin/sh", ["-c", "\"$2\" -q -c \"$0\" > \"$1\"", made + "/bsdtar.tar", made + "/zstd.tar.zst", zstd]).status == 0 {
+                archives.append(("zstd", made + "/zstd.tar.zst"))
+            }
+            // From a pipe, on every core, with a 128 MB window: one frame that doesn't say how much it holds.
+            if run("/bin/sh", ["-c", "cat \"$0\" | \"$2\" -q -T0 --long=27 -c > \"$1\"", made + "/bsdtar.tar",
+                               made + "/zstd-long.tar.zst", zstd]).status == 0 {
+                archives.append(("zstd -T0 --long, from a pipe", made + "/zstd-long.tar.zst"))
+            }
+        }
+        if let pzstd = homebrew("pzstd"),
+           run(pzstd, ["-q", "-p", "4", made + "/bsdtar.tar", "-o", made + "/pzstd.tar.zst"]).status == 0 {
+            archives.append(("pzstd, many frames", made + "/pzstd.tar.zst"))
+        }
+        if let python = zstdPython, run(python, ["-I", "-c", """
+            import sys, tarfile
+            with tarfile.open(sys.argv[2] + '/pax.tar.zst', 'w:zst', format=tarfile.PAX_FORMAT) as t:
+                t.add(sys.argv[1], arcname='\(Fixture.rootName)')
+            """, tree, made]).status == 0 {
+            archives.append(("Python, pax format, zstd", made + "/pax.tar.zst"))
         }
         let python = run("/usr/bin/python3", ["-I", "-c", """
             import sys, tarfile
@@ -129,6 +150,24 @@ extension OneFileTests {
         _ = run("/bin/sh", ["-c", "/usr/bin/gzip -c \"$0\" > \"$0.gz\"", tiny])
         if case .finished = unpack(tiny + ".gz", into: into, c) {
             c.expect((try? String(contentsOfFile: into + "/tiny.txt", encoding: .utf8)) == "hi\n", "a tiny one too")
+        }
+        // zstd: from OneFile's own encoder (a skippable frame first), and from zstd's.
+        let bytes = [UInt8](FileManager.default.contents(atPath: note) ?? Data())
+        if let block = bytes.withUnsafeBufferPointer({ Zstd.block($0.baseAddress!, $0.count) }) {
+            FileManager.default.createFile(atPath: single + "/framed.txt.zst", contents: block)
+            if case .finished(let summary) = unpack(single + "/framed.txt.zst", into: into, c) {
+                c.expect(summary.single && FileManager.default.contentsEqual(atPath: note, andPath: into + "/framed.txt"),
+                         "framed.txt.zst unpacks to framed.txt, the same")
+            }
+        }
+        if let zstd = homebrew("zstd") {
+            _ = run("/bin/sh", ["-c", "\"$1\" -q -c \"$0\" > \"$0.zst\"", note, zstd])
+            let zstdInto = single + "/zstd-out"
+            try? FileManager.default.createDirectory(atPath: zstdInto, withIntermediateDirectories: true)
+            if case .finished(let summary) = unpack(note + ".zst", into: zstdInto, c) {
+                c.expect(summary.single && FileManager.default.contentsEqual(atPath: note, andPath: zstdInto + "/note.txt"),
+                         "note.txt.zst (from zstd) unpacks to note.txt, the same")
+            }
         }
         FileManager.default.createFile(atPath: single + "/not.tar", contents: Data(repeating: 0x7A, count: 4_096))
         if case .failed(let message) = unpack(single + "/not.tar", into: into, nil) {
@@ -204,7 +243,7 @@ extension OneFileTests {
         c.section("Damaged and cut-off files")
         let damaged = fixture.base + "/damaged"
         try? FileManager.default.createDirectory(atPath: damaged, withIntermediateDirectories: true)
-        for method in [PackMethod.gzip, .xz, .plain] {
+        for method in [PackMethod.gzip, .zstd, .xz, .plain] {
             let archive = fixture.base + "/out/Root.\(method.fileExtension)"
             guard var data = FileManager.default.contents(atPath: archive) else { continue }
             let cut = damaged + "/Cut.\(method.fileExtension)"
@@ -293,14 +332,23 @@ extension OneFileTests {
             c.section("Sending the test folder to another OneFile (over loopback), \(method.title)")
             sendAndReceive(fixture, method: method, accept: true, c)
         }
+        c.section("Sending Efficient to an older OneFile, which can't unpack zstd")
+        let old = Wire.decode(Wire.Welcome.self, Data(#"{"version":1,"name":"Old","kind":"laptop","key":""}"#.utf8))
+        c.expect(old != nil && old?.methods == nil, "an older OneFile's welcome still reads, and lists no methods")
+        Handshake.unpacks = [.plain, .gzip, .xz]
+        sendAndReceive(fixture, method: .zstd, accept: true, expect: .gzip, c)
+        Handshake.unpacks = PackMethod.allCases
         c.section("Declining")
         sendAndReceive(fixture, method: .plain, accept: false, c)
     }
 
-    private static func sendAndReceive(_ fixture: Fixture, method: PackMethod, accept: Bool, _ c: Checks) {
+    /// Sends with `method`; it should go as `expect` (the method, unless the receiver can't unpack it).
+    private static func sendAndReceive(_ fixture: Fixture, method: PackMethod, accept: Bool, expect: PackMethod? = nil,
+                                       _ c: Checks) {
         let destination = fixture.base + "/received-\(method.rawValue)"
         try? FileManager.default.createDirectory(atPath: destination, withIntermediateDirectories: true)
         let codes = Locked<(sent: String?, received: String?)>((nil, nil))
+        let methods = Locked<(sent: PackMethod?, offered: String?)>((nil, nil))
         let receivedOutcome = Locked<ReceiveSession.Event?>(nil)
         let receiverDone = DispatchSemaphore(value: 0)
         let sessions = Locked<[ReceiveSession]>([])
@@ -312,6 +360,7 @@ extension OneFileTests {
                 switch event {
                 case .offer(let offer, let code, _, _):
                     codes.withLock { $0.received = code }
+                    methods.withLock { $0.offered = offer.method }
                     if offer.name != Fixture.rootName { print("  offer named \(offer.name)") }
                     if accept {
                         box.withLock { $0 }?.accept(into: URL(fileURLWithPath: destination))
@@ -348,8 +397,9 @@ extension OneFileTests {
                                   options: .init(leaveOut: Fixture.leaveOut, method: method), totals: nil,
                                   me: ThisMac.identity) { event in
             switch event {
-            case .code(let code, _):
+            case .code(let code, _, let method):
                 codes.withLock { $0.sent = code }
+                methods.withLock { $0.sent = method }
                 // The person sending checks the code too.
                 sender.withLock { $0 }?.confirm()
             case .connecting, .accepted, .answered: break
@@ -369,6 +419,9 @@ extension OneFileTests {
         if accept { _ = receiverDone.wait(timeout: .now() + 30) }
         let (sent, received) = codes.withLock { $0 }
         c.expect(sent != nil && sent == received, "both Macs show the same code: \(sent ?? "-") and \(received ?? "-")")
+        let used = methods.withLock { $0 }
+        c.expect(used.sent == (expect ?? method) && used.offered == (expect ?? method).rawValue,
+                 "it goes as \((expect ?? method).title): \(String(describing: used.sent)), offered as \(used.offered ?? "-")")
         if !accept {
             if case .declined = sentOutcome.withLock({ $0 }) { c.expect(true, "") } else {
                 c.fail("declining gave \(String(describing: sentOutcome.withLock { $0 }))")

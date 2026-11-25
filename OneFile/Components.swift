@@ -118,6 +118,21 @@ struct LeaveOutRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let ignored = model.gitIgnored {
+                Toggle(isOn: $model.respectGitignore) {
+                    HStack(spacing: 6) {
+                        Text("Leave out what Git ignores")
+                            .font(.callout.weight(.semibold))
+                        Text(ignored.isEmpty ? "(nothing here)" : "\(Format.items(Int64(ignored.count))) at the top: \(Self.examples(ignored))")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .help("This folder is in a Git project: what its .gitignore files list (build output, dependencies, caches) can stay behind, as in a fresh checkout.")
+            }
             HStack(spacing: 6) {
                 Text("Leave out")
                     .font(.callout.weight(.semibold))
@@ -136,6 +151,89 @@ struct LeaveOutRow: View {
             }
         }
         .disabled(model.isLocked)
+    }
+}
+
+extension LeaveOutRow {
+    /// "node_modules, dist, .env…": the first few names Git ignores.
+    static func examples(_ paths: [String]) -> String {
+        let names = paths.prefix(4).map { ($0 as NSString).lastPathComponent }
+        return names.joined(separator: ", ") + (paths.count > 4 ? "…" : "")
+    }
+}
+
+/// Packing options beyond the method: splitting into parts.
+struct PackOptionsRow: View {
+    @ObservedObject var model: PackModel
+
+    static let sizes: [(title: String, bytes: Int64)] = [
+        ("1 GB", 1_000_000_000), ("2 GB", 2_000_000_000), ("4 GB, for FAT32 drives", 4_000_000_000),
+        ("10 GB", 10_000_000_000), ("25 GB", 25_000_000_000),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            splitRow
+            lockRow
+        }
+        .disabled(model.isLocked)
+    }
+
+    private var lockRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Toggle(isOn: $model.locking) {
+                    Text("Lock with a password")
+                        .font(.callout.weight(.semibold))
+                }
+                .toggleStyle(.checkbox)
+                Text(model.locking ? "opens in OneFile, or with the free age tool anywhere" : "the age format: ChaCha20-Poly1305, scrypt")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            if model.locking {
+                HStack(spacing: 8) {
+                    SecureField("Password", text: $model.password)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 190)
+                    SecureField("Again", text: $model.passwordAgain)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 190)
+                    if let problem = model.passwordProblem {
+                        Text(problem)
+                            .font(.caption)
+                            .foregroundStyle(problem.hasPrefix("Longer") ? Color.secondary : Color.orange)
+                    } else {
+                        Label("OK", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+                }
+                Text("OneFile doesn't keep it anywhere: without it, the file can't be opened.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var splitRow: some View {
+        HStack(spacing: 8) {
+            Text("Split into parts")
+                .font(.callout.weight(.semibold))
+            Picker("", selection: Binding(get: { model.splitSize ?? 0 }, set: { model.setSplit($0 == 0 ? nil : $0) })) {
+                Text("No, one file").tag(Int64(0))
+                ForEach(Self.sizes, id: \.bytes) { size in
+                    Text(size.title).tag(size.bytes)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+            Text(model.splitSize == nil ? "for an upload limit or a FAT32 drive" : "Unpack opens them all from the first")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
     }
 }
 
@@ -234,6 +332,9 @@ struct WorkPanel: View {
     let line: String
     let current: String
     var warning: String?
+    /// Pausing and resuming, where the job can (not sending: the other Mac would wait).
+    var paused = false
+    var pauseToggle: (() -> Void)?
     let stop: () -> Void
 
     var body: some View {
@@ -309,6 +410,10 @@ struct WorkPanel: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .lineLimit(1)
+                }
+                if let pauseToggle {
+                    Button(paused ? "Resume" : "Pause", action: pauseToggle)
+                        .help(paused ? "Carry on from where it paused" : "Pause after the files in hand, to carry on later")
                 }
                 Button("Stop", action: stop)
                     .keyboardShortcut(".", modifiers: .command)

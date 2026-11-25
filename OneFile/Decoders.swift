@@ -37,7 +37,7 @@ final class OrderedPipeline: @unchecked Sendable {
     private let slots: Int
     private var finished = false
     private var stopped = false
-    private let queue = DispatchQueue(label: "OneFile.decode", qos: .userInitiated, attributes: .concurrent)
+    private let queue = DispatchQueue(label: "OneFile.decode", qos: Work.dispatchQoS, attributes: .concurrent)
 
     init(slots: Int) {
         self.slots = max(slots, 1)
@@ -121,27 +121,160 @@ final class OrderedPipeline: @unchecked Sendable {
 
 /// An archive file open for reading, from any thread. It closes when the last job using it is done.
 final class InputFile: @unchecked Sendable {
-    let fd: Int32
-    let size: Int64
+    /// One file, or the parts of a split one, read one after another as if they were one.
+    private let fds: [Int32]
+    /// Where each part starts in the whole.
+    private let starts: [Int64]
+    /// What's read: the file itself, or once a locked (age) file is unlocked, its contents.
+    private(set) var size: Int64
+    /// The file on the disk, all its parts.
+    let rawSize: Int64
+    /// Unlocked: reads come from the age payload, decrypted on the way.
+    private var age: AgeReader?
+    /// On the internet: reads are range requests.
+    private let remote: RemoteFile?
 
-    init?(path: String) {
-        fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else { return nil }
-        var info = stat()
-        guard fstat(fd, &info) == 0 else {
-            close(fd)
-            return nil
-        }
-        size = Int64(info.st_size)
+    convenience init?(path: String) {
+        self.init(paths: [path])
     }
 
-    deinit { close(fd) }
+    init?(paths: [String]) {
+        var fds: [Int32] = []
+        var starts: [Int64] = []
+        var total: Int64 = 0
+        for path in paths {
+            let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC)
+            var info = stat()
+            guard fd >= 0, fstat(fd, &info) == 0 else {
+                let code = errno
+                if fd >= 0 { close(fd) }
+                fds.forEach { close($0) }
+                errno = code
+                return nil
+            }
+            fds.append(fd)
+            starts.append(total)
+            total += Int64(info.st_size)
+        }
+        guard !fds.isEmpty else { return nil }
+        self.fds = fds
+        self.starts = starts
+        size = total
+        rawSize = total
+        remote = nil
+    }
 
-    /// Reads exactly `count` bytes at `offset`. False if it can't.
+    /// An archive on the internet (see `RemoteFile`).
+    init(remote: RemoteFile) {
+        fds = []
+        starts = [0]
+        size = remote.size
+        rawSize = remote.size
+        self.remote = remote
+    }
+
+    /// Why reading from the internet failed, if that's where it is and it did.
+    var remoteFailure: String? { remote?.failure }
+
+    /// Opens an archive (all its parts, if it was split), unlocked with `password` if it's locked.
+    static func open(_ url: URL, password: String?) -> Result<InputFile, DecodeError> {
+        let file: InputFile
+        if Remote.isRemote(url) {
+            switch Remote.objects(for: url) {
+            case .success(let objects): file = InputFile(remote: RemoteFile(objects))
+            case .failure(let error): return .failure(error)
+            }
+        } else {
+            let parts = SplitParts.parts(of: url)?.map(\.path) ?? [url.path]
+            guard let local = InputFile(paths: parts) else {
+                return .failure(DecodeError(message: "Couldn't open “\(url.lastPathComponent)”: \(Packer.message(errno))."))
+            }
+            file = local
+        }
+        guard file.isLocked else { return .success(file) }
+        guard let password, !password.isEmpty else {
+            return .failure(DecodeError(message: "“\(url.lastPathComponent)” is locked with a password."))
+        }
+        switch file.unlock(password) {
+        case nil: return .success(file)
+        case .wrongPassword?: return .failure(DecodeError(message: "That isn't the password for “\(url.lastPathComponent)”."))
+        case .unsupported(let why)?: return .failure(DecodeError(message: why))
+        default: return .failure(DecodeError(message: "“\(url.lastPathComponent)” is damaged: its lock can't be read."))
+        }
+    }
+
+    /// Locked with a password: an age file.
+    var isLocked: Bool {
+        guard age == nil else { return false }
+        let intro = Array((Age.intro + "\n").utf8)
+        var head = [UInt8](repeating: 0, count: intro.count)
+        guard rawSize >= Int64(intro.count), head.withUnsafeMutableBytes({ rawRead($0.count, at: 0, into: $0.baseAddress!) }) else {
+            return false
+        }
+        return head == intro
+    }
+
+    /// Unlocks an age file with its password: nil once it's open, else why not.
+    func unlock(_ password: String) -> Age.OpenError? {
+        let span = Int(min(rawSize, 4_096))
+        var head = [UInt8](repeating: 0, count: span)
+        guard head.withUnsafeMutableBytes({ rawRead(span, at: 0, into: $0.baseAddress!) }) else { return .damaged }
+        switch Age.open(head, password: password) {
+        case .failure(let error):
+            return error
+        case .success(let opened):
+            var nonce = [UInt8](repeating: 0, count: 16)
+            guard Int64(opened.headerEnd + 16) <= rawSize,
+                  nonce.withUnsafeMutableBytes({ rawRead(16, at: Int64(opened.headerEnd), into: $0.baseAddress!) }),
+                  let reader = AgeReader(fileKey: opened.fileKey, headerEnd: opened.headerEnd, nonce: nonce, fileSize: rawSize) else {
+                return .damaged
+            }
+            age = reader
+            size = reader.size
+            return nil
+        }
+    }
+
+    deinit { fds.forEach { close($0) } }
+
+    /// Reads exactly `count` bytes at `offset` (decrypted, for an unlocked file). False if it can't
+    /// (or, locked, if they've been changed).
     func read(_ count: Int, at offset: Int64, into buffer: UnsafeMutableRawPointer) -> Bool {
+        guard let age else { return rawRead(count, at: offset, into: buffer) }
+        guard offset >= 0, offset + Int64(count) <= size else { return false }
+        let plain = Int64(Age.chunk)
+        let sealed = plain + Int64(Age.tagSize)
+        var piece = [UInt8](repeating: 0, count: Int(sealed))
         var done = 0
         while done < count {
-            let got = pread(fd, buffer + done, count - done, off_t(offset) + off_t(done))
+            let position = offset + Int64(done)
+            let index = position / plain
+            let within = Int(position % plain)
+            let at = age.start + index * sealed
+            let length = Int(min(sealed, rawSize - at))
+            guard length > Age.tagSize,
+                  piece.withUnsafeMutableBytes({ rawRead(length, at: at, into: $0.baseAddress!) }),
+                  let opened = piece.withUnsafeBytes({ age.open(index, UnsafeRawBufferPointer(rebasing: $0.prefix(length))) }),
+                  within < opened.count else { return false }
+            let take = min(count - done, opened.count - within)
+            opened.withUnsafeBytes { (buffer + done).copyMemory(from: $0.baseAddress! + within, byteCount: take) }
+            done += take
+        }
+        return true
+    }
+
+    /// Reads exactly `count` bytes of the file itself (across parts, if need be).
+    private func rawRead(_ count: Int, at offset: Int64, into buffer: UnsafeMutableRawPointer) -> Bool {
+        if let remote { return remote.read(count, at: offset, into: buffer) }
+        var done = 0
+        while done < count {
+            let position = offset + Int64(done)
+            guard position < rawSize else { return false }
+            var part = fds.count - 1
+            while starts[part] > position { part -= 1 }
+            let partEnd = part + 1 < starts.count ? starts[part + 1] : rawSize
+            let want = min(count - done, Int(partEnd - position))
+            let got = pread(fds[part], buffer + done, want, off_t(position - starts[part]))
             if got > 0 { done += got; continue }
             if got < 0 && errno == EINTR { continue }
             return false
@@ -159,12 +292,13 @@ final class InputFile: @unchecked Sendable {
 
 /// How an archive file is compressed, going by its first bytes (not its name).
 enum ArchiveFormat: String, Sendable {
-    case tar, gzip, xz
+    case tar, gzip, zstd, xz
 
     var title: String {
         switch self {
         case .tar: "tar, uncompressed"
         case .gzip: "tar.gz (gzip)"
+        case .zstd: "tar.zst (zstd)"
         case .xz: "tar.xz (xz)"
         }
     }
@@ -175,15 +309,18 @@ enum ArchiveFormat: String, Sendable {
         func starts(_ magic: [UInt8]) -> Bool { head.count >= magic.count && Array(head.prefix(magic.count)) == magic }
         if starts([0x1F, 0x8B]) { return .success(.gzip) }
         if starts([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) { return .success(.xz) }
+        // A zstd frame, or a skippable frame (OneFile's and pzstd's files start with one).
+        if starts([0x28, 0xB5, 0x2F, 0xFD]) || (head.count >= 4 && head[0] & 0xF0 == 0x50 && Array(head[1..<4]) == [0x2A, 0x4D, 0x18]) {
+            return .success(.zstd)
+        }
         let other: String?
         if starts([0x42, 0x5A, 0x68]) { other = "a bzip2 file (.tar.bz2)" }
-        else if starts([0x28, 0xB5, 0x2F, 0xFD]) { other = "a zstd file (.tar.zst)" }
         else if starts([0x50, 0x4B, 0x03, 0x04]) || starts([0x50, 0x4B, 0x05, 0x06]) { other = "a zip file" }
         else if starts([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) { other = "a 7-Zip file" }
         else if starts([0x52, 0x61, 0x72, 0x21]) { other = "a RAR file" }
         else { other = nil }
         if let other {
-            return .failure(DecodeError(message: "“\(name)” is \(other). OneFile unpacks .tar, .tar.gz and .tar.xz files; double-click this one to open it with Archive Utility."))
+            return .failure(DecodeError(message: "“\(name)” is \(other). OneFile unpacks .tar, .tar.gz, .tar.zst and .tar.xz files; double-click this one to open it with Archive Utility."))
         }
         if head.count == 512 && TarHeader.checksumOK(head) { return .success(.tar) }
         return .failure(DecodeError(message: "“\(name)” isn't a tar file, or it's damaged at the start."))
@@ -195,8 +332,9 @@ enum ArchiveFormat: String, Sendable {
 /// Reads an archive file and hands its tar stream, decompressed, to an `OrderedPipeline`.
 ///
 /// OneFile's own files decompress on every core: each gzip member says in its header how long it
-/// is (see `BlockCompressor`), and each xz stream is listed in the index at its end, so every piece
-/// can be found and decompressed at once. Other files decompress in order, on one core.
+/// is (see `BlockCompressor`), so does the skippable frame before each zstd frame (see `Zstd`), and
+/// each xz stream is listed in the index at its end, so every piece can be found and decompressed
+/// at once. Other files decompress in order, on one core.
 enum ArchiveDecoder {
     /// Plain tar is read in pieces this big.
     static let readPiece = 8 << 20
@@ -225,6 +363,13 @@ enum ArchiveDecoder {
             let pipeline = OrderedPipeline(slots: indexed ? decoders + 2 : 4)
             run("OneFile gunzip") {
                 if indexed { readIndexedGzip(file, pipeline) } else { readGzip(file, from: 0, pipeline) }
+            }
+            return Started(pipeline: pipeline, parallel: indexed)
+        case .zstd:
+            let indexed = file.bytes(Int(min(file.size, Int64(Zstd.peekSize))), at: 0).flatMap { Zstd.header($0) } != nil
+            let pipeline = OrderedPipeline(slots: indexed ? decoders + 2 : 4)
+            run("OneFile unzstd") {
+                if indexed { readIndexedZstd(file, pipeline) } else { readZstd(file, from: 0, pipeline) }
             }
             return Started(pipeline: pipeline, parallel: indexed)
         case .xz:
@@ -273,8 +418,9 @@ enum ArchiveDecoder {
 
     // MARK: gzip
 
-    /// The member's length and how much it holds, from OneFile's subfield of its header.
-    static func indexedMember(_ header: [UInt8]) -> (size: Int, holds: Int)? {
+    /// The member's length and how much it holds, from OneFile's subfield of its header. Nil if
+    /// either is more than `limit`.
+    static func indexedMember(_ header: [UInt8], limit: Int = largestPiece) -> (size: Int, holds: Int)? {
         guard header.count >= 24, header[0] == 0x1F, header[1] == 0x8B, header[2] == 8, header[3] & 0x04 != 0 else {
             return nil
         }
@@ -287,7 +433,7 @@ enum ArchiveDecoder {
                     Int(header[i]) | Int(header[i + 1]) << 8 | Int(header[i + 2]) << 16 | Int(header[i + 3]) << 24
                 }
                 let size = word(at + 4), holds = word(at + 8)
-                guard size >= 32, size <= largestPiece, holds <= largestPiece else { return nil }
+                guard size >= 32, size <= limit, holds <= limit else { return nil }
                 return (size, holds)
             }
             at += 4 + length
@@ -312,7 +458,7 @@ enum ArchiveDecoder {
         }
     }
 
-    private static func inflateMember(_ file: InputFile, at offset: Int64, size: Int, holds: Int) -> Result<Chunk, DecodeError> {
+    static func inflateMember(_ file: InputFile, at offset: Int64, size: Int, holds: Int) -> Result<Chunk, DecodeError> {
         let input = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
         defer { input.deallocate() }
         guard file.read(size, at: offset, into: input) else { return .failure(DecodeError(message: unreadable)) }
@@ -480,7 +626,7 @@ enum ArchiveDecoder {
         pipeline.finish()
     }
 
-    private static func decodeXz(_ file: InputFile, _ stream: XzStream) -> Result<Chunk, DecodeError> {
+    static func decodeXz(_ file: InputFile, _ stream: XzStream) -> Result<Chunk, DecodeError> {
         let size = Int(stream.size)
         let input = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
         defer { input.deallocate() }
@@ -624,8 +770,8 @@ enum ArchiveDecoder {
 // MARK: - Decoding a block sent from another Mac
 
 extension ArchiveDecoder {
-    /// Decompresses one block (a gzip member, an xz stream, or plain bytes) known to hold `holds`
-    /// bytes of the tar stream.
+    /// Decompresses one block (a gzip member, a zstd frame, an xz stream, or plain bytes) known to
+    /// hold `holds` bytes of the tar stream.
     static func decodeBlock(_ block: UnsafeRawBufferPointer, holds: Int, method: PackMethod) -> Chunk? {
         let chunk = Chunk(capacity: holds)
         guard let base = block.baseAddress else { return holds == 0 ? chunk : nil }
@@ -642,6 +788,8 @@ extension ArchiveDecoder {
             stream.next_out = chunk.base.assumingMemoryBound(to: Bytef.self)
             stream.avail_out = uInt(chunk.capacity)
             guard inflate(&stream, Z_FINISH) == Z_STREAM_END, Int(stream.total_out) == holds else { return nil }
+        case .zstd:
+            return Zstd.decompress(block, holds: holds)
         case .xz:
             return xzWhole(block, holds: holds)
         }

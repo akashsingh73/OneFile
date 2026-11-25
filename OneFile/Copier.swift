@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Copies a folder to another place, usually another drive, as fast as the two drives allow.
 ///
@@ -26,6 +27,22 @@ final class Copier: @unchecked Sendable {
         var leaveOut: [String]
         /// Kinds of rebuildable folders to leave out (`Rebuildable` rule ids).
         var skipRebuildable: Set<Int16> = []
+        /// Exact paths to leave out (what Git ignores, when asked).
+        var excluded: Set<String> = []
+        /// Once it's all on the drive, read each copied file back and check it matches the
+        /// original (SHA-256, worked out while copying).
+        var verify = false
+        /// Updating a copy: note what's there that the original no longer has, to offer to move
+        /// it to the Trash afterwards. (The copier itself never deletes anything.)
+        var mirror = false
+    }
+
+    /// Something in the copy that the original no longer has.
+    struct Extra: Sendable, Identifiable, Hashable {
+        var id: String { path }
+        let path: String
+        let isFolder: Bool
+        let size: Int64
     }
 
     enum Target: Sendable, Equatable {
@@ -54,6 +71,10 @@ final class Copier: @unchecked Sendable {
         var finishing = false
         /// Then it's made sure of on the drive (an external one), so it's safe to unplug.
         var saving = false
+        /// Then each file copied is read back and checked against the original.
+        var verifying = false
+        var verified: Int64 = 0
+        var toVerify: Int64 = 0
         /// The big file being copied, if any, and how far along.
         var bigName: String?
         var bigDone: Int64 = 0
@@ -77,6 +98,7 @@ final class Copier: @unchecked Sendable {
         var resumed: Bool
         var updated: Bool
         var leftOut: Int64
+        var gitIgnored: Int64 = 0
         var rebuildable: Int64
         var cloudOnly: Int64
         var otherDisks: Int64
@@ -84,6 +106,11 @@ final class Copier: @unchecked Sendable {
         var changed: Int64
         var problems: [Problem]
         var problemCount: Int
+        /// Files read back from the drive that matched their originals, and those that didn't.
+        var verified: Int64 = 0
+        var mismatched: Int64 = 0
+        /// What's in the copy that the original no longer has (when mirroring).
+        var extras: [Extra] = []
     }
 
     enum Outcome: Sendable {
@@ -132,6 +159,7 @@ final class Copier: @unchecked Sendable {
         var done = false
         var failure: String?
         var leftOut: Int64 = 0
+        var gitIgnored: Int64 = 0
         var rebuildable: Int64 = 0
         var cloudOnly: Int64 = 0
         var otherDisks: Int64 = 0
@@ -148,7 +176,13 @@ final class Copier: @unchecked Sendable {
     private let madeFolders = Locked(Set<String>())
     /// Where the first name of each file with several names went, for the others (hard links).
     private let firstNames = Locked([FileID: String]())
-    private let readAhead = DispatchQueue(label: "OneFile.readAhead", qos: .userInitiated)
+    /// Each copied file's SHA-256, worked out while copying, to check the copy against (verifying).
+    private let digests = Locked([String: [UInt8]]())
+    /// What the copy has that the original doesn't (mirroring). Walker only, then the end.
+    private var extras: [Extra] = []
+    private let readAhead = DispatchQueue(label: "OneFile.readAhead", qos: Work.dispatchQoS)
+    /// Pausing waits here, between files and between pieces of a big one.
+    private let gate = PauseGate()
 
     /// The copy's folder at the destination, open, and its path.
     private var root: Int32 = -1
@@ -177,7 +211,7 @@ final class Copier: @unchecked Sendable {
             completion(run())
         }
         thread.name = "OneFile copier"
-        thread.qualityOfService = .userInitiated
+        thread.qualityOfService = Work.qos
         thread.start()
     }
 
@@ -186,7 +220,13 @@ final class Copier: @unchecked Sendable {
         state.withLock { $0.stopped = true }
         small.stop()
         big.stop()
+        gate.release()
     }
+
+    /// Pauses between files (and between pieces of a big one), or carries on.
+    func pause() { gate.pause() }
+    func resume() { gate.resume() }
+    var isPaused: Bool { gate.isPaused }
 
     func progress() -> Progress {
         state.withLock { $0.progress }
@@ -283,8 +323,10 @@ final class Copier: @unchecked Sendable {
         dateSlack = destinationDrive?.isFAT == true || sourceDrive?.isFAT == true ? 2 : 1
         let existing = prepared.resumed || isUpdate
 
-        let rules = WalkRules(leaveOut: options.leaveOut, device: walkRoot.entry.device,
-                              skipRebuildable: options.skipRebuildable)
+        var walkRules = WalkRules(leaveOut: options.leaveOut, device: walkRoot.entry.device,
+                                  skipRebuildable: options.skipRebuildable)
+        walkRules.excluded = options.excluded
+        let rules = walkRules
         if let knownTotals {
             state.withLock { $0.progress.counted = knownTotals; $0.progress.totals = knownTotals }
         } else {
@@ -308,7 +350,7 @@ final class Copier: @unchecked Sendable {
                 finished.leave()
             }
             worker.name = "OneFile copy \(index + 1)"
-            worker.qualityOfService = .userInitiated
+            worker.qualityOfService = Work.qos
             worker.start()
         }
         finished.enter()
@@ -317,7 +359,7 @@ final class Copier: @unchecked Sendable {
             finished.leave()
         }
         bigLane.name = "OneFile big files"
-        bigLane.qualityOfService = .userInitiated
+        bigLane.qualityOfService = Work.qos
         bigLane.start()
 
         walk(walkRoot, rules, existing: existing)
@@ -337,6 +379,11 @@ final class Copier: @unchecked Sendable {
             fsync_volume_np(root, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)
         }
         let savingSeconds = Date().timeIntervalSince(copied)
+        var verified: Int64 = 0, mismatched: Int64 = 0
+        if options.verify && !plan.clone {
+            (verified, mismatched) = verifyCopies()
+            if isStopped { return endEarly(started) }
+        }
 
         var destination = URL(fileURLWithPath: rootPath)
         if case .new(let folder, let name) = target {
@@ -356,10 +403,10 @@ final class Copier: @unchecked Sendable {
             .finished(Summary(
                 destination: destination, files: s.progress.files, folders: s.progress.folders,
                 bytes: s.progress.bytes, unchanged: s.progress.unchanged, unchangedBytes: s.progress.unchangedBytes,
-                seconds: seconds, savingSeconds: savingSeconds, plan: plan, resumed: prepared.resumed, updated: updated, leftOut: s.leftOut,
+                seconds: seconds, savingSeconds: savingSeconds, plan: plan, resumed: prepared.resumed, updated: updated, leftOut: s.leftOut, gitIgnored: s.gitIgnored,
                 rebuildable: s.rebuildable, cloudOnly: s.cloudOnly, otherDisks: s.otherDisks,
                 unsupported: s.unsupported, changed: s.changed, problems: s.problems,
-                problemCount: s.progress.problemCount))
+                problemCount: s.progress.problemCount, verified: verified, mismatched: mismatched, extras: extras))
         }
     }
 
@@ -381,6 +428,7 @@ final class Copier: @unchecked Sendable {
         state.withLock { $0.done = true }
         small.stop()
         big.stop()
+        gate.release()
     }
 
     /// Makes (or finds) the folder the copy goes in.
@@ -485,7 +533,8 @@ final class Copier: @unchecked Sendable {
         var seen: [FileID: String] = [:]
         var there: [String: FolderEntry] = [:]
         let insensitive = !(destinationDrive?.caseSensitive ?? false)
-        var leftOut: Int64 = 0, rebuildable: Int64 = 0, cloudOnly: Int64 = 0, otherDisks: Int64 = 0, unsupported: Int64 = 0
+        var leftOut: Int64 = 0, gitIgnored: Int64 = 0, rebuildable: Int64 = 0, cloudOnly: Int64 = 0, otherDisks: Int64 = 0
+        var unsupported: Int64 = 0
         let rootLength = walkRoot.diskPath.utf8.count
         let plan = plan
 
@@ -549,6 +598,7 @@ final class Copier: @unchecked Sendable {
                             return true
                         }
                     }
+                    if options.mirror && !there.isEmpty { noteExtras(in: folder.diskPath, at: path, there, rules, key) }
                 }
                 return true
             },
@@ -619,6 +669,7 @@ final class Copier: @unchecked Sendable {
             skip: { reason in
                 switch reason {
                 case .leftOut: leftOut += 1
+                case .gitIgnored: gitIgnored += 1
                 case .rebuildable: rebuildable += 1
                 case .cloudOnly: cloudOnly += 1
                 case .otherDisk: otherDisks += 1
@@ -637,6 +688,7 @@ final class Copier: @unchecked Sendable {
         }
         state.withLock { s in
             s.leftOut = leftOut
+            s.gitIgnored = gitIgnored
             s.rebuildable = rebuildable
             s.cloudOnly = cloudOnly
             s.otherDisks = otherDisks
@@ -644,6 +696,23 @@ final class Copier: @unchecked Sendable {
         }
         small.finish()
         big.finish()
+    }
+
+    /// What's in the copy's folder at `path` that the original's folder doesn't have at all (left
+    /// out isn't missing: it stays). On an exFAT or FAT drive, "._" files are attributes, not extras.
+    private func noteExtras(in source: String, at path: String, _ there: [String: FolderEntry], _ rules: WalkRules,
+                            _ key: (String) -> String) {
+        var names = Set<String>()
+        FolderReader.read(source) { entries in
+            for entry in entries { names.insert(key(entry.name)) }
+            return true
+        }
+        let sidecars = !(destinationDrive?.nativeAttributes ?? true)
+        for (name, item) in there where !names.contains(name) {
+            if rules.leavesOut(item.name) || (sidecars && item.name.hasPrefix("._")) { continue }
+            extras.append(Extra(path: path.isEmpty ? item.name : path + "/" + item.name,
+                                isFolder: item.kind == .directory, size: item.size))
+        }
     }
 
     /// Whether the "._" file of the item at `path` is there (beside it, in its folder).
@@ -662,6 +731,7 @@ final class Copier: @unchecked Sendable {
             var files: Int64 = 0, bytes: Int64 = 0, changed: Int64 = 0
             var last = ""
             for job in jobs {
+                gate.wait()
                 if isStopped { return }
                 switch copy(job, buffer: buffer) {
                 case .copied(let size, let sizeChanged):
@@ -734,6 +804,7 @@ final class Copier: @unchecked Sendable {
         defer { close(output) }
 
         var copied: Int64
+        var hasher: SHA256? = options.verify ? SHA256() : nil
         if let buffer, job.size < Int64(Self.bufferSize) {
             // Small: read it whole (and a byte more, to notice one that grew), then write it in one go.
             var done = 0
@@ -753,21 +824,23 @@ final class Copier: @unchecked Sendable {
                 return .skipped
             }
             guard writeOut(output, buffer, done, job) else { return .skipped }
+            hasher?.update(bufferPointer: UnsafeRawBufferPointer(start: buffer, count: done))
             copied = Int64(done)
             // It grew since the folder was listed: the rest goes too.
             if done == wanted {
-                guard let rest = stream(input, output, job, [buffer], counting: false) else { return .skipped }
+                guard let rest = stream(input, output, job, [buffer], counting: false, hasher: &hasher) else { return .skipped }
                 copied += rest
             }
         } else if let buffer {
             // A big file on a small file's thread (it couldn't be cloned): in pieces, one buffer.
-            guard let result = stream(input, output, job, [buffer], counting: false) else { return .skipped }
+            guard let result = stream(input, output, job, [buffer], counting: false, hasher: &hasher) else { return .skipped }
             copied = result
         } else {
-            guard let result = stream(input, output, job, buffers, counting: true) else { return .skipped }
+            guard let result = stream(input, output, job, buffers, counting: true, hasher: &hasher) else { return .skipped }
             copied = result
         }
         let sizeChanged = copied != job.size
+        if let hasher { digests.withLock { $0[job.path] = Array(hasher.finalize()) } }
         copyAttributes(job, from: input, to: output)
         finishFile(output, job)
         if let id = job.linkGroup { firstNames.withLock { $0[id] = job.path } }
@@ -778,13 +851,14 @@ final class Copier: @unchecked Sendable {
     /// one is written. What it copied, or nil if it couldn't (the problem is noted). `counting`, it
     /// adds to the progress as it goes (the big-file lane).
     private func stream(_ input: Int32, _ output: Int32, _ job: CopyJob,
-                        _ buffers: [UnsafeMutableRawPointer], counting: Bool) -> Int64? {
+                        _ buffers: [UnsafeMutableRawPointer], counting: Bool, hasher: inout SHA256?) -> Int64? {
         let pointers = buffers.map { SharedPointer($0.assumingMemoryBound(to: UInt8.self)) }
         let ahead = buffers.count > 1
         var current = 0
         var piece = Self.fill(input, pointers[0])
         var total: Int64 = 0
         while piece.count > 0 && piece.error == 0 {
+            gate.wait()
             if isStopped {
                 unlinkPartial(job)
                 return nil
@@ -797,6 +871,7 @@ final class Copier: @unchecked Sendable {
                 let into = pointers[next]
                 readAhead.async(group: group) { nextPiece.withLock { $0 = Self.fill(input, into) } }
                 wrote = writeOut(output, buffers[current], piece.count, job)
+                hasher?.update(bufferPointer: UnsafeRawBufferPointer(start: buffers[current], count: piece.count))
                 group.wait()
                 guard wrote else { return nil }
                 total += Int64(piece.count)
@@ -811,6 +886,7 @@ final class Copier: @unchecked Sendable {
             } else {
                 wrote = writeOut(output, buffers[current], piece.count, job)
                 guard wrote else { return nil }
+                hasher?.update(bufferPointer: UnsafeRawBufferPointer(start: buffers[current], count: piece.count))
                 total += Int64(piece.count)
                 piece = Self.fill(input, pointers[current])
             }
@@ -822,6 +898,63 @@ final class Copier: @unchecked Sendable {
             return nil
         }
         return total
+    }
+
+    /// Reads every copied file back from the drive (not from memory) and checks it against the
+    /// SHA-256 of the original worked out while copying. How many matched, and didn't.
+    private func verifyCopies() -> (Int64, Int64) {
+        let list = digests.withLock { Array($0) }
+        state.withLock { s in
+            s.progress.verifying = true
+            s.progress.toVerify = Int64(list.count)
+        }
+        let next = Locked(0)
+        let counts = Locked((matched: Int64(0), mismatched: Int64(0)))
+        let group = DispatchGroup()
+        let drive = destinationDrive?.name ?? "the drive"
+        for _ in 0..<min(8, max(list.count, 1)) {
+            group.enter()
+            let thread = Thread { [self] in
+                defer { group.leave() }
+                let buffer = UnsafeMutableRawPointer.allocate(byteCount: Self.bufferSize, alignment: 16_384)
+                defer { buffer.deallocate() }
+                while !isStopped {
+                    let index = next.withLock { value -> Int in
+                        defer { value += 1 }
+                        return value
+                    }
+                    guard index < list.count else { return }
+                    gate.wait()
+                    let (path, digest) = list[index]
+                    let fd = openat(root, path, O_RDONLY | O_NOFOLLOW_ANY | O_CLOEXEC)
+                    var matched = false
+                    if fd >= 0 {
+                        Comparer.forgetCached(fd)
+                        var hasher = SHA256()
+                        var failed = false
+                        while true {
+                            let got = Comparer.readFull(fd, buffer, Self.bufferSize)
+                            if got < 0 { failed = true; break }
+                            hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buffer, count: got))
+                            if got < Self.bufferSize { break }
+                        }
+                        close(fd)
+                        matched = !failed && Array(hasher.finalize()) == digest
+                    }
+                    if !matched {
+                        problem(path, "Read back from “\(drive)”, it doesn't match the original. Copy it again.")
+                    }
+                    counts.withLock { c in
+                        if matched { c.matched += 1 } else { c.mismatched += 1 }
+                    }
+                    state.withLock { $0.progress.verified += 1 }
+                }
+            }
+            thread.qualityOfService = Work.qos
+            thread.start()
+        }
+        group.wait()
+        return counts.withLock { ($0.matched, $0.mismatched) }
     }
 
     /// Reads up to a buffer's worth of a file: what it got, and the error that stopped it, if any.

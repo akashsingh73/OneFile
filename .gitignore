@@ -1,11 +1,19 @@
 # Build output (build.sh and test.sh)
 build/
 
-# Files made while trying the app out
+# Files made while trying the app out (locked ones, and parts of split ones, too)
 *.tar
 *.tar.gz
 *.tar.xz
+*.tar.zst
 *.tar.part
+*.age
+*.tar.[0-9][0-9][0-9]
+*.tar.*.[0-9][0-9][0-9]
 
 # macOS Finder metadata
 .DS_Store
+
+# Python bytecode (the age test runs a Python reader)
+__pycache__/
+*.pyc

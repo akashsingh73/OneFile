@@ -114,6 +114,7 @@ final class ReceiveModel: ObservableObject {
             progress = Unpacker.Progress()
             meter.reset()
             finishedAt = nil
+            Work.jobStarted()
             activity = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiated, .idleSystemSleepDisabled], reason: "Receiving a folder from another Mac")
             let timer = Timer(timeInterval: 0.15, repeats: true) { _ in
@@ -167,7 +168,7 @@ final class ReceiveModel: ObservableObject {
         timer = nil
         if let progress = session?.progress() { self.progress = progress }
         session = nil
-        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        if let activity { ProcessInfo.processInfo.endActivity(activity); Work.jobEnded() }
         activity = nil
         stage = final
         if case .finished = final { finishedAt = Date() }

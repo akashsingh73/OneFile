@@ -21,6 +21,8 @@ final class CopyModel: ObservableObject {
     @Published private(set) var destinationDrive: Drive?
     /// Free space where the copy goes (asking takes a moment on APFS, so it's kept).
     @Published private(set) var destinationFree: Int64?
+    /// The cloud service that syncs the destination, if one does (Google Drive, iCloud Drive…).
+    @Published private(set) var cloudService: String?
     @Published private(set) var sourceDrive: Drive?
     /// The drives connected now, for picking one.
     @Published private(set) var drives: [Drive] = []
@@ -34,6 +36,17 @@ final class CopyModel: ObservableObject {
     @Published var showingProblems = false
     @Published private(set) var ejecting = false
     @Published private(set) var ejectMessage: String?
+    /// Read each copied file back from the drive, and check it against the original.
+    @Published var verify: Bool {
+        didSet { UserDefaults.standard.set(verify, forKey: "copyVerify") }
+    }
+    /// Updating a copy: offer to move to the Trash what the original no longer has.
+    @Published var mirror: Bool {
+        didSet { UserDefaults.standard.set(mirror, forKey: "copyMirror") }
+    }
+    @Published var showingExtras = false
+    @Published private(set) var trashing = false
+    @Published private(set) var trashMessage: String?
 
     private var copier: Copier?
     private var timer: Timer?
@@ -44,6 +57,8 @@ final class CopyModel: ObservableObject {
     private static let destinationKey = "copyDestination"
 
     init() {
+        verify = UserDefaults.standard.bool(forKey: "copyVerify")
+        mirror = UserDefaults.standard.bool(forKey: "copyMirror")
         if let saved = UserDefaults.standard.string(forKey: Self.destinationKey),
            FileManager.default.fileExists(atPath: saved) {
             destination = URL(fileURLWithPath: saved)
@@ -131,6 +146,7 @@ final class CopyModel: ObservableObject {
         sourceDrive = source.flatMap { Drive.of($0.path) }
         destinationDrive = destination.flatMap { Drive.of($0.path) }
         destinationFree = destinationDrive?.free
+        cloudService = destination.flatMap { CloudSync.service(for: $0.path) }
         if let source, let destination {
             existing = Copier.existing(for: source, name: source.lastPathComponent, in: destination)
         } else {
@@ -169,7 +185,11 @@ final class CopyModel: ObservableObject {
     func copy() {
         guard canCopy, let source, let target else { return }
         let pack = PackModel.shared
-        let options = Copier.Options(leaveOut: WalkRules.parse(pack.leaveOut), skipRebuildable: pack.skipRebuildable)
+        var options = Copier.Options(leaveOut: WalkRules.parse(pack.leaveOut), skipRebuildable: pack.skipRebuildable,
+                                     excluded: pack.excludedPaths)
+        options.verify = verify
+        if case .update = target { options.mirror = mirror }
+        trashMessage = nil
         let copier = Copier(source: source, target: target, options: options, knownTotals: pack.knownTotals)
         self.copier = copier
         progress = copier.progress()
@@ -177,6 +197,7 @@ final class CopyModel: ObservableObject {
         ejectMessage = nil
         stage = .copying
         pack.objectWillChange.send()
+        Work.jobStarted()
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Copying a folder")
         let timer = Timer(timeInterval: 0.15, repeats: true) { _ in
@@ -199,6 +220,43 @@ final class CopyModel: ObservableObject {
         copier?.cancel()
     }
 
+    // MARK: Pausing
+
+    @Published private(set) var isPaused = false
+    /// Paused because the Mac went onto its battery: it carries on when it's back on power.
+    private(set) var pausedForBattery = false
+
+    func togglePause() {
+        guard let copier else { return }
+        if isPaused {
+            copier.resume()
+            isPaused = false
+            pausedForBattery = false
+        } else {
+            copier.pause()
+            isPaused = true
+        }
+    }
+
+    func pauseForBattery() {
+        guard let copier, !isPaused else { return }
+        copier.pause()
+        isPaused = true
+        pausedForBattery = true
+    }
+
+    func resumeAfterBattery() {
+        guard let copier, pausedForBattery else { return }
+        copier.resume()
+        isPaused = false
+        pausedForBattery = false
+    }
+
+    var pausedText: String {
+        pausedForBattery ? "Paused while the Mac is on its battery" : "Paused"
+    }
+
+
     private func tick() {
         guard let copier else { return }
         progress = copier.progress()
@@ -210,7 +268,9 @@ final class CopyModel: ObservableObject {
         timer = nil
         if let copier { progress = copier.progress() }
         copier = nil
-        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        isPaused = false
+        pausedForBattery = false
+        if let activity { ProcessInfo.processInfo.endActivity(activity); Work.jobEnded() }
         activity = nil
         switch outcome {
         case .finished(let summary): stage = .finished(summary)
@@ -227,6 +287,49 @@ final class CopyModel: ObservableObject {
             existing = Copier.existing(for: source, name: source.lastPathComponent, in: destination)
         }
         if !NSApp.isActive { NSApp.requestUserAttention(.informationalRequest) }
+    }
+
+    /// Whether updating will offer to remove what the original no longer has.
+    var isUpdating: Bool {
+        if case .folder = existing, !makeNewCopy { return true }
+        return false
+    }
+
+    /// Compares the folder with the copy that's there (or was just made).
+    func compareWithCopy() {
+        guard let source else { return }
+        let copy: URL?
+        if let summary { copy = summary.destination } else if case .folder(let url) = existing { copy = url } else { copy = nil }
+        guard let copy else { return }
+        CompareModel.shared.compare(source, copy)
+    }
+
+    /// Moves what the copy has and the original doesn't to the Trash (asked for, after the list).
+    func trashExtras() {
+        guard let summary, !trashing else { return }
+        trashing = true
+        let root = summary.destination
+        let extras = summary.extras
+        DispatchQueue.global(qos: .userInitiated).async {
+            var moved = 0, failed = 0
+            for extra in extras {
+                do {
+                    try FileManager.default.trashItem(at: root.appendingPathComponent(extra.path), resultingItemURL: nil)
+                    moved += 1
+                } catch {
+                    failed += 1
+                }
+            }
+            let message = failed == 0
+                ? "Moved \(Format.items(Int64(moved))) to the Trash: the copy matches the original."
+                : "Moved \(Format.items(Int64(moved))) to the Trash; \(Format.items(Int64(failed))) couldn't be (a network drive may have no Trash)."
+            onMain {
+                let model = CopyModel.shared
+                model.trashing = false
+                model.showingExtras = false
+                model.trashMessage = message
+            }
+        }
     }
 
     /// Back to the start, ready to copy again (or update the copy).
@@ -369,11 +472,17 @@ final class CopyModel: ObservableObject {
         // Updating a copy that's there: only what changed goes, so it's quick anyway.
         if case .folder = existing, !makeNewCopy { return nil }
         guard summary == nil, !plan.clone, let drive = destinationDrive,
-              case .counted(let totals) = PackModel.shared.count, totals.files >= 2_000 else { return nil }
+              case .counted(let totals) = PackModel.shared.count else { return nil }
+        let packed = PackModel.shared.expectedSize(.plain) ?? totals.archiveBytes
+        // A folder a cloud service syncs: each file is an upload of its own.
+        if let cloudService, totals.files >= 500 {
+            return PackHint(headline: "Faster as one file",
+                            detail: "\(cloudService) uploads every file on its own, so these \(Format.count(totals.files)) files would be \(Format.count(totals.files)) uploads, which can take hours. As one packed file: one upload of \(Format.bytes(packed)). Unpack it on the Mac it goes to.")
+        }
+        guard totals.files >= 2_000 else { return nil }
         let average = totals.bytes / max(totals.files, 1)
         let slowForSmall = drive.isWindowsFormat || drive.medium == .hdd || drive.isNetwork
         guard slowForSmall, average < 512 << 10 else { return nil }
-        let packed = PackModel.shared.expectedSize(.plain) ?? totals.archiveBytes
         var detail: String
         if let space = expectedSpace, drive.blockSize >= 32 << 10, space > totals.bytes * 2 {
             detail = "“\(drive.name)” gives every file at least \(Format.block(drive.blockSize)), so these \(Format.count(totals.files)) files (\(Format.bytes(totals.bytes))) would take about \(Format.bytes(space)) there. As one packed file: \(Format.bytes(packed))."
@@ -448,12 +557,19 @@ final class CopyModel: ObservableObject {
     }
 
     var percentText: String {
+        if progress.verifying, progress.toVerify > 0 {
+            return (Double(progress.verified) / Double(progress.toVerify)).formatted(.percent.precision(.fractionLength(0)))
+        }
         if progress.saving { return "100%" }
         guard let fraction else { return "Copying…" }
         return fraction.formatted(.percent.precision(.fractionLength(0)))
     }
 
     var etaText: String {
+        if isPaused { return pausedText }
+        if progress.verifying {
+            return "Checking each file on “\(destinationDrive?.name ?? "the drive")”: \(Format.count(progress.verified)) of \(Format.count(progress.toVerify))"
+        }
         if progress.saving { return "Making sure it's all on “\(destinationDrive?.name ?? "the drive")”…" }
         if progress.finishing { return "Folders' dates and links…" }
         guard progress.totals != nil else { return "Counting what's left…" }

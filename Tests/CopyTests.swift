@@ -334,3 +334,28 @@ struct DiskImage {
         self.mount = Copier.realPath(mount)
     }
 }
+
+extension OneFileTests {
+    /// `bash test.sh --delete FOLDER`: deletes a folder for good, many files at once, and says how
+    /// long it took. (For measuring against `rm -rf`.)
+    static func deleteBenchmark(_ path: String) -> Bool {
+        let deleter = Deleter(folder: URL(fileURLWithPath: path))
+        let done = DispatchSemaphore(value: 0)
+        let result = Locked<Deleter.Outcome?>(nil)
+        deleter.start { outcome in
+            result.withLock { $0 = outcome }
+            done.signal()
+        }
+        done.wait()
+        switch result.withLock({ $0 })! {
+        case .finished(let summary):
+            print(String(format: "Deleted %@ items in %.2f s (%@ a second)", Format.count(summary.deleted), summary.seconds,
+                         Format.count(Int64(Double(summary.deleted) / max(summary.seconds, 0.001)))))
+            return true
+        case .stopped: return false
+        case .failed(let message):
+            print("Couldn't delete: \(message)")
+            return false
+        }
+    }
+}

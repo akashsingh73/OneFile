@@ -192,6 +192,21 @@ struct AddressPopover: View {
                 Button("Add") { model.addAddress() }
                     .disabled(Peer.manual(model.address) == nil)
             }
+            Divider()
+            Text("Far away, or not a Mac with OneFile? Pack it to the cloud, and send the link.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Pack to the Cloud…") {
+                model.showingAddress = false
+                AppModel.shared.mode = .pack
+                if let account = CloudModel.shared.accounts.first {
+                    PackModel.shared.packToCloud(account)
+                } else {
+                    CloudModel.shared.startAdding(in: .main)
+                }
+            }
+            .font(.caption)
         }
         .padding(14)
         .frame(width: 300)
@@ -234,7 +249,7 @@ struct SendPanel: View {
         case .sending(let peer, _):
             WorkPanel(
                 percent: model.percentText,
-                chip: ("\(pack.method.title) · encrypted", "lock.fill"),
+                chip: ("\((model.method ?? pack.method).title) · encrypted", "lock.fill"),
                 eta: model.etaText,
                 bars: [.init(label: "Packed and sent", fraction: model.sentFraction),
                        .init(label: "Unpacked on “\(peer)”", fraction: model.fraction)],
@@ -285,8 +300,12 @@ struct SenderCodePanel: View {
     }
 
     private var message: String {
-        if model.confirmed { return "Nothing is sent until “\(peer)” accepts too." }
-        return "Both Macs must show the same code. If they don't, something is between the two Macs (or it isn't the Mac you meant): cancel."
+        var message = model.confirmed ? "Nothing is sent until “\(peer)” accepts too."
+            : "Both Macs must show the same code. If they don't, something is between the two Macs (or it isn't the Mac you meant): cancel."
+        if let method = model.method, method != PackModel.shared.method {
+            message += " It goes as \(method.title): the OneFile on “\(peer)” is older, and can't unpack \(PackModel.shared.method.title)."
+        }
+        return message
     }
 }
 

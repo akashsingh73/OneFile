@@ -2,7 +2,7 @@
 # Builds OneFile.app using only Apple's free Command Line Tools.
 # No Xcode, no Apple ID, no developer account.
 #
-#   bash build.sh                   build into ./build/OneFile.app
+#   bash build.sh                   build into ./build/OneFile.app (with the onefile command inside)
 #   bash build.sh --install         build, then copy to /Applications
 #   bash build.sh --install --open  build, install, and launch it
 set -euo pipefail
@@ -10,8 +10,9 @@ cd "$(dirname "$0")"
 
 APP_NAME="OneFile"
 APP="build/$APP_NAME.app"
-VERSION="2.1"
-BUILD_NUMBER="3"
+# The version is kept in one place, for the app and the onefile command alike.
+VERSION="$(sed -n 's/.*static let current = "\(.*\)".*/\1/p' OneFile/Version.swift)"
+BUILD_NUMBER="$(sed -n 's/.*static let build = "\(.*\)".*/\1/p' OneFile/Version.swift)"
 MIN_MACOS="14.0"
 ARCH="$(uname -m)"
 
@@ -35,7 +36,11 @@ fi
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
+
+# zstd's library, compiled from its own source in Vendor/zstd (see the README there).
+source Tools/zstd.sh
+zstd_library "$ARCH" "$MIN_MACOS" "$SDK"
 
 echo "Compiling $APP_NAME $VERSION for $ARCH (macOS $MIN_MACOS or later)…"
 if ! xcrun swiftc \
@@ -43,12 +48,34 @@ if ! xcrun swiftc \
   -sdk "$SDK" \
   -target "$ARCH-apple-macos$MIN_MACOS" \
   -module-name "$APP_NAME" \
+  -I "$ZSTD_INCLUDE" \
   -o "$APP/Contents/MacOS/$APP_NAME" \
-  OneFile/*.swift 2>&1 | tee build/compile.log; then
+  OneFile/*.swift "$ZSTD_LIBRARY" 2>&1 | tee build/compile.log; then
   echo
   echo "The build stopped. The full list of errors is in build/compile.log."
   exit 1
 fi
+
+# The onefile command: the same engine, without the windows (every file that doesn't import
+# SwiftUI or AppKit), plus CLI/main.swift.
+ENGINE=()
+for file in OneFile/*.swift; do
+  /usr/bin/grep -q -E '^import (SwiftUI|AppKit)' "$file" || ENGINE+=("$file")
+done
+echo "Compiling the onefile command…"
+if ! xcrun swiftc \
+  -O -wmo -swift-version 5 \
+  -sdk "$SDK" \
+  -target "$ARCH-apple-macos$MIN_MACOS" \
+  -module-name "$APP_NAME" \
+  -I "$ZSTD_INCLUDE" \
+  -o "$APP/Contents/Helpers/onefile" \
+  "${ENGINE[@]}" CLI/main.swift "$ZSTD_LIBRARY" 2>&1 | tee build/compile-cli.log; then
+  echo
+  echo "The build stopped. The full list of errors is in build/compile-cli.log."
+  exit 1
+fi
+codesign --force --sign - "$APP/Contents/Helpers/onefile"
 
 # The app icon (drawn by Tools/make-icon.swift).
 if [[ -f OneFile/AppIcon.icns ]]; then
@@ -84,7 +111,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
                 <string>org.gnu.gnu-zip-tar-archive</string>
                 <string>org.tukaani.xz-archive</string>
                 <string>org.tukaani.tar-xz-archive</string>
+                <string>com.facebook.zstd-archive</string>
             </array>
+        </dict>
+    </array>
+    <!-- macOS has no type for zstd files (.tar.zst, .tzst), so it's declared here: imported, as
+         OneFile doesn't own the format. -->
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.facebook.zstd-archive</string>
+            <key>UTTypeDescription</key><string>Zstandard archive</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string><string>public.archive</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key><array><string>zst</string><string>tzst</string></array>
+                <key>public.mime-type</key><array><string>application/zstd</string></array>
+            </dict>
         </dict>
     </array>
     <!-- Finder's Services menu: Control-click a folder or a tar file. -->
@@ -113,10 +156,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
                 <string>org.gnu.gnu-zip-tar-archive</string>
                 <string>org.tukaani.xz-archive</string>
                 <string>org.tukaani.tar-xz-archive</string>
+                <string>com.facebook.zstd-archive</string>
             </array>
         </dict>
     </array>
     <!-- Send and Receive: finding other Macs running OneFile, and connecting to them. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>OneFile link</string>
+            <key>CFBundleURLSchemes</key><array><string>onefile</string></array>
+        </dict>
+    </array>
     <key>NSLocalNetworkUsageDescription</key>
     <string>OneFile finds other Macs running OneFile on your network, so you can send folders between them.</string>
     <key>NSBonjourServices</key>

@@ -42,11 +42,18 @@ struct ArchiveCard: View {
     var body: some View {
         if let archive = model.archive {
             VStack(spacing: 5) {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: archive.path))
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 50, height: 50)
-                Text(archive.lastPathComponent)
+                if model.isRemote {
+                    Image(systemName: "cloud.fill")
+                        .font(.system(size: 38))
+                        .foregroundStyle(Brand.gradient)
+                        .frame(width: 50, height: 50)
+                } else {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: archive.path))
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: 50, height: 50)
+                }
+                Text(model.partCount > 1 ? SplitParts.wholeName(archive.lastPathComponent) : archive.lastPathComponent)
                     .font(.system(size: 15, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -74,32 +81,57 @@ struct ArchiveCard: View {
                         .foregroundStyle(.green)
                         .lineLimit(1)
                 }
+                if let problem = model.remoteProblem {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                }
                 Spacer(minLength: 2)
-                Button("Change…") { model.chooseArchive() }
-                    .controlSize(.small)
+                ArchiveSourceMenu(model: model)
                     .disabled(model.isUnpacking)
             }
             .cardStyle(highlighted: model.isDropTarget)
         } else {
-            Button {
-                model.chooseArchive()
-            } label: {
-                VStack(spacing: 8) {
-                    Image(systemName: "doc.badge.plus")
-                        .font(.system(size: 40, weight: .light))
-                        .foregroundStyle(Brand.gradient)
-                    Text("Drop a tar file here")
-                        .font(.system(size: 15, weight: .semibold))
-                    Text(".tar, .tar.gz or .tar.xz, or click to choose one")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+            VStack(spacing: 6) {
+                Button {
+                    model.chooseArchive()
+                } label: {
+                    VStack(spacing: 8) {
+                        Image(systemName: "doc.badge.plus")
+                            .font(.system(size: 40, weight: .light))
+                            .foregroundStyle(Brand.gradient)
+                        Text("Drop a tar file here")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text(".tar, .tar.gz, .tar.zst or .tar.xz, or click to choose one")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if model.openingRemote {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini)
+                        Text("Opening…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if let problem = model.remoteProblem {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
                         .multilineTextAlignment(.center)
                 }
-                .padding(.horizontal, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
+                HStack(spacing: 8) {
+                    Button("Open a Link…") { CloudModel.shared.linkDraft = ""; CloudModel.shared.openingLink = true }
+                    Button("From the Cloud…") { CloudModel.shared.browse() }
+                }
+                .controlSize(.small)
             }
-            .buttonStyle(.plain)
             .cardStyle(highlighted: model.isDropTarget, dashed: true)
         }
     }
@@ -225,6 +257,8 @@ struct UnpackPanel: View {
                 current: model.progress.current,
                 warning: model.progress.problemCount > 0
                     ? "\(Format.items(Int64(model.progress.problemCount))) couldn't be unpacked" : nil,
+                paused: model.isPaused,
+                pauseToggle: model.togglePause,
                 stop: model.stop)
         case .finished(let summary):
             UnpackFinished(model: model, summary: summary)
@@ -243,10 +277,16 @@ struct UnpackReady: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if model.locked {
+                UnlockBox(model: model)
+                    .padding(.bottom, 12)
+            }
             VStack(alignment: .leading, spacing: 10) {
                 Text("What's inside")
                     .font(.callout.weight(.semibold))
-                if let seen = model.seen {
+                if model.locked {
+                    InfoLine(symbol: "lock.fill", text: "Locked: unlock it to see what's inside.")
+                } else if let seen = model.seen {
                     if seen.kinds.totalFiles > 0 {
                         CompositionBar(kinds: seen.kinds, legendCount: 5)
                     }
@@ -271,6 +311,10 @@ struct UnpackReady: View {
                     InfoLine(symbol: "xmark.octagon.fill", text: message, tint: .red)
                 } else if model.archive == nil {
                     InfoLine(symbol: "sparkles", text: "Choose a tar file: OneFile reads it through first, so you see what's inside and that it's intact before anything is written.")
+                } else if model.isRemote {
+                    InfoLine(symbol: "icloud.and.arrow.down", text: model.index != nil
+                             ? "It stays \(model.remoteLabel ?? "where it is"): unpacking downloads it as it goes, many pieces at once, and nothing else is read until then."
+                             : "It isn't read through first, which would mean downloading it all: unpacking downloads it as it goes, many pieces at once, and checks it on the way.")
                 } else {
                     InfoLine(symbol: "magnifyingglass", text: "Reading it through, to show what's inside and check it's intact. You can unpack right away.")
                 }
@@ -278,6 +322,10 @@ struct UnpackReady: View {
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.035)))
+            if let text = model.indexText {
+                IndexBox(model: model, text: text)
+                    .padding(.top, 12)
+            }
             VStack(alignment: .leading, spacing: 7) {
                 InfoLine(symbol: "bolt.fill", text: "\(Unpacker.writers) files are written at once, and OneFile's own files decompress on every core: about 3× as fast as tar on small files.")
                 InfoLine(symbol: "lock.shield.fill", text: "Nothing is replaced, and nothing can be written outside the new folder. Stopping deletes what was unpacked.")
@@ -330,5 +378,182 @@ struct UnpackFinished: View {
             notes.append("\(Format.items(summary.refused)) left out: \(summary.refused == 1 ? "its path leads" : "their paths lead") outside the folder.")
         }
         return notes
+    }
+}
+
+/// OneFile's own archive: look inside, take out what's needed, check every file.
+struct IndexBox: View {
+    @ObservedObject var model: UnpackModel
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "list.bullet.rectangle.portrait.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Brand.gradient)
+                Text(text)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 10) {
+                Button("Look Inside…") { model.showingBrowser = true }
+                if model.checking {
+                    ProgressView(value: model.checkFraction).frame(width: 120)
+                    Button("Stop") { model.stopChecking() }
+                } else {
+                    Button("Check Every File") { model.checkEveryFile() }
+                }
+                Spacer()
+            }
+            .controlSize(.small)
+            if let result = model.checkResult {
+                Label(result.text, systemImage: result.ok ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(result.ok ? Color.green : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Brand.teal.opacity(0.07)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Brand.teal.opacity(0.25)))
+        .sheet(isPresented: $model.showingBrowser) {
+            ArchiveBrowser(model: model)
+        }
+    }
+}
+
+/// What's in a OneFile archive, from its index: search, pick, take out.
+struct ArchiveBrowser: View {
+    @ObservedObject var model: UnpackModel
+
+    var body: some View {
+        let entries = model.browserEntries
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Inside “\(SplitParts.wholeName(model.archive?.lastPathComponent ?? ""))”")
+                    .font(.headline)
+                Spacer()
+                TextField("Search", text: $model.browserQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 220)
+            }
+            List(selection: $model.browserSelection) {
+                ForEach(entries) { entry in
+                    HStack(spacing: 8) {
+                        Image(systemName: Self.symbol(entry.kind))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+                        Text(entry.path)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 8)
+                        if entry.kind == .file {
+                            Text(Format.bytes(entry.size))
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(Date(timeIntervalSince1970: TimeInterval(entry.modified)).formatted(date: .abbreviated, time: .omitted))
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 90, alignment: .trailing)
+                    }
+                    .tag(entry.id)
+                }
+            }
+            .listStyle(.bordered)
+            HStack(spacing: 10) {
+                if model.extracting {
+                    ProgressView().controlSize(.small)
+                    Text("\(Format.count(model.extractProgress.files)) taken out…")
+                        .font(.callout)
+                        .monospacedDigit()
+                    Button("Stop") { model.stopExtracting() }
+                } else if let result = model.extractResult {
+                    Text(result)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                } else {
+                    Text(model.browserSelection.isEmpty ? "Choose files or folders (⌘-click for several): only their blocks are read."
+                                                        : "\(Format.items(Int64(model.browserSelection.count))) chosen.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { model.showingBrowser = false }
+                Button("Take Out…") { model.extractSelected() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.browserSelection.isEmpty || model.extracting)
+            }
+        }
+        .padding(20)
+        .frame(width: 680, height: 520)
+    }
+
+    static func symbol(_ kind: ArchiveIndex.Kind) -> String {
+        switch kind {
+        case .folder: "folder"
+        case .symlink, .hardLink: "link"
+        case .fifo: "arrow.left.arrow.right"
+        case .file: "doc"
+        }
+    }
+}
+
+/// A file locked with a password (age): the password, to open it.
+struct UnlockBox: View {
+    @ObservedObject var model: UnpackModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(Brand.gradient)
+                Text("Locked with a password")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                SecureField("Password", text: $model.password)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 240)
+                    .onSubmit { model.unlock() }
+                Button(model.unlocking ? "Unlocking…" : "Unlock") { model.unlock() }
+                    .disabled(model.password.isEmpty || model.unlocking)
+                if let problem = model.unlockProblem {
+                    Text(problem)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Brand.teal.opacity(0.07)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Brand.teal.opacity(0.25)))
+    }
+}
+
+/// Where the archive comes from: a file, a link, or the cloud.
+struct ArchiveSourceMenu: View {
+    @ObservedObject var model: UnpackModel
+
+    var body: some View {
+        Menu("Change…") {
+            Button("Choose a File…") { model.chooseArchive() }
+            Button("Open a Link…") {
+                CloudModel.shared.linkDraft = ""
+                CloudModel.shared.openingLink = true
+            }
+            Button("From the Cloud…") { CloudModel.shared.browse() }
+        }
+        .controlSize(.small)
+        .fixedSize()
     }
 }
