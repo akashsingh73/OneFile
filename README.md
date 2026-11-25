@@ -25,8 +25,10 @@ hours. OneFile does the per-file work once, as fast as the disk allows, and move
 - **Pack**: 300,000 small files and 3 GB of video into one file in **5.5 s**. Finder's Compress takes
   155 s on the same folder, and macOS's `tar` 114 s. Lock it with a password, split it into parts, or
   leave out what Git ignores.
-- **Unpack**: about **3× as fast as `tar`** on small files, decompressing OneFile's own files on every
-  core. Safe: it never replaces anything, and nothing can be written outside the new folder.
+- **Unpack**: about **3× as fast as `tar`** on small files, decompressing on every core: OneFile's own
+  files, and `.tar.gz` and `.tar.xz` files from other tools too (a 1.5 GB `.tar.xz` from `xz` in
+  0.8 s instead of 6.8 s). Safe: it never replaces anything, and nothing can be written outside the
+  new folder.
 - **One file out of millions**: OneFile's archives carry an index (with every file's SHA-256) that
   other tools never see. Look inside at once, take out one file without unpacking the rest, or check
   every file.
@@ -342,8 +344,60 @@ check it. The same blocks are what let the index point into the middle of a comp
 zstd is zstd's own library (1.5.7, by Meta, BSD-licensed), compiled from its source in `Vendor/zstd`
 by `build.sh`: macOS doesn't come with it. gzip is macOS's zlib, and xz its Compression framework.
 
-**Unpacking.** Decompression runs ahead on every core for OneFile's own files (and in order, on one
-core, for anyone else's). Files are collected into batches straight from the decompressed data, and
+**Unpacking.** Decompression runs ahead on every core, for other tools' files as well as OneFile's
+own. `xz` cuts what it compresses into blocks of 24 MB, each compressed on its own (since xz 5.6,
+unless told not to), and lists them in the index at the end of the file, so each block goes to a core
+of its own. Apple's decoder reads only whole streams, so each block is given a header, an index and a
+footer of its own, and the block's CRC is still checked. macOS's own `tar -cJf` writes one block,
+which has to be read in order.
+
+A `.tar.gz` from `tar` or `gzip` is one long deflate stream, with nothing to say where its blocks
+start, and each block can copy from the 32 KB before it. OneFile cuts the file into 1 MB spans and
+decompresses each, on a core of its own, from the first place in it where a block could start (its
+header holds together, by zlib's own checks), as rapidgzip and pugz do. The 32 KB before a span isn't
+known yet, so the span is decompressed twice at once, with two different made-up 32 KB in their place:
+the bytes that come out differently are copies from before the span, and the two values say from
+where. They're filled in once the span before is done, on every core too. Once a span's last 32 KB are
+all its own, the second decompression stops. A span is used only if it starts exactly where the one
+before it stopped (each stops at the first place after its end where the next could start), so a place
+that only looked like a block start never lines up; that stretch is decompressed again, in order. The
+gzip CRC is checked at the end, as always. zlib does the decompressing: on one core of an M4 Max it
+already reads 1.2 to 2.6 GB/s, and the spans together 3.7 to 5.9 GB/s.
+
+How hard it pushes depends on the Mac, which OneFile looks at first. A Mac with room to spare (8
+cores or more, an efficiency core counting as half, and 16 GB or more: an M1 Pro or later Pro, any
+Max or Ultra, an 8-core Intel Mac) decompresses spans on every core from the start, as many as it
+has cores and 2 more, since speed comes first and it has what that costs: on an M4 Max, 16 at once
+unpacked 1.5 GB of big files in 0.23 s (plain tar: 0.19 to 0.24 s), 9 at once in 0.29 s.
+
+A smaller Mac (an M1 to M4 with 4 performance cores, or 8 GB), or one set to work gently, needs its
+cores for writing, and decompressing twice is 2 to 3 times the work, so spans run only as far as
+unpacking needs them. OneFile starts in order, on one core, and looks every 50 ms at how much of the
+time it waited to hand on what it made. If it hardly waited, unpacking was waiting for it, and it
+takes every span it can have; if it waited a while, what it handed on is what unpacking took, and it
+runs just enough spans to give a third more than that, or none. It adds them quickly and drops them
+slowly, since too few costs time and too many only a core, and it follows an archive that changes
+half way, from big files to small ones. With 12 of the M4 Max's 16 cores kept busy, to stand in for
+a smaller Mac, that way unpacked 41,704 small files in the same time with 0.9 s less CPU and
+420 MB → 173 MB of memory, and archives of big files about 7% slower. With fewer than 4 cores at full
+speed, gzip always decompresses in order.
+
+xz gets every core on every Mac: it decompresses ten times slower, so unpacking nearly always waits
+for it, and holding fewer blocks only made it slower. What it holds is capped instead, by memory:
+an eighth of it on a Mac with room to spare (at most 4 GB), a sixteenth on others (at most 1 GB, so
+512 MB with 8 GB). A block takes what it holds, its compressed bytes, and its dictionary, which xz
+makes a third of a block. A 1.5 GB file from `xz -9` (8 blocks of 192 MB) unpacked in 1.67 s with
+all 8 at once, against 2.25 s with 4.
+
+| Unpacking, M4 Max | `.tar` | `.tar.gz` before | `.tar.gz` now | `.tar.xz` before | `.tar.xz` now |
+|-------------------|--------|------------------|---------------|------------------|---------------|
+| 2 files, 1.5 GB   | 0.21 s | 0.92 s           | 0.23 s        | 6.8 s            | 0.76 s        |
+| `/usr/share`: 19,270 files, 520 MB | 1.27 s | 1.62 s | 1.4 s      | 4.9 s            | 1.7 s         |
+
+(The `.tar.gz` made by macOS's `gzip -6`, the `.tar.xz` by `xz` 5.8.) zstd's own files are one frame,
+which has to be read in order, but zstd is quick on one core; `pzstd`'s are many frames, like OneFile's.
+
+Files are collected into batches straight from the decompressed data, and
 each batch is written by four threads while the next is read: APFS makes small files fastest from
 about four threads (on an M4 Max, 54,000 a second, against 20,000 from one, and slower again from
 eight). Links, and folders' permissions and dates, are set last.
@@ -459,6 +513,15 @@ over 500 checks:
   `zstd` (one frame, one with a 128 MB window from a pipe, and `pzstd`'s many) and Python (GNU and pax
   formats, gzip and zstd), and single compressed files, each compared exactly with the original. The
   index: listing, taking files out, checking, and damage found.
+- **Every core, for other tools' files**: `xz -T0` with each of its checks (CRC32, CRC64, SHA-256,
+  none), two files joined, and a damaged block. gzip files from `gzip -1`, `-6` and `-9` and from
+  zlib's every strategy (filtered, Huffman only, RLE, fixed codes), small and big memory, a 512-byte
+  window, flushed every 100 KB, every header field, two files joined, random bytes and zeros: all cut
+  into small spans and compared exactly; spans that start in the wrong place, a changed byte, a wrong
+  CRC and a file cut short. Which Macs have room to spare; on the others, spans only when unpacking
+  waits (none when it's slow, or with 2 cores at full speed); and how many xz blocks Macs from
+  4 cores and 8 GB up hold at once. `bash test.sh --decode FILE` times decompressing a file of your
+  own.
 - **Locking**: scrypt against RFC 7914's examples, wrong passwords, damage, and an independent age
   reader in Python opening what OneFile locks.
 - **Attacks and damage**: `..` paths, absolute paths, links that would be written through, links
@@ -508,6 +571,7 @@ bash test.sh --copy ~/Projects/Research /Volumes/MyDrive
 | `Packer.swift`, `FolderReader.swift`, `Tar.swift` | Listing folders in bulk, and packing them into a tar stream |
 | `Compressor.swift`, `Method.swift`, `Estimator.swift` | Compressing on every core, the four methods, and their estimates |
 | `Unpacker.swift`, `Decoders.swift`, `Zstd.swift` | Reading tar, gzip, zstd and xz (in parallel where it can), and unpacking safely |
+| `Gunzip.swift` | Decompressing another tool's gzip file on every core |
 | `Index.swift`, `Extract.swift` | OneFile's index, taking files out, and checking every file |
 | `Age.swift` | Locking with a password: the age format, scrypt, ChaCha20-Poly1305 |
 | `Copier.swift`, `Comparer.swift`, `Drives.swift`, `AppleDouble.swift` | Copying between drives, comparing folders, what each drive is, and reading `._` files |

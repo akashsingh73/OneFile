@@ -327,7 +327,7 @@ struct UnpackReady: View {
                     .padding(.top, 12)
             }
             VStack(alignment: .leading, spacing: 7) {
-                InfoLine(symbol: "bolt.fill", text: "\(Unpacker.writers) files are written at once, and OneFile's own files decompress on every core: about 3× as fast as tar on small files.")
+                InfoLine(symbol: "bolt.fill", text: "\(Unpacker.writers) files are written at once, and archives decompress on every core, other tools' .tar.gz and .tar.xz too: about 3× as fast as tar on small files.")
                 InfoLine(symbol: "lock.shield.fill", text: "Nothing is replaced, and nothing can be written outside the new folder. Stopping deletes what was unpacked.")
             }
             .padding(.top, 14)

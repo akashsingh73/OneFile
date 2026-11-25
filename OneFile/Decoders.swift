@@ -38,6 +38,8 @@ final class OrderedPipeline: @unchecked Sendable {
     private var finished = false
     private var stopped = false
     private let queue = DispatchQueue(label: "OneFile.decode", qos: Work.dispatchQoS, attributes: .concurrent)
+    /// The most held at once.
+    private var peakHeld = 0
 
     init(slots: Int) {
         self.slots = max(slots, 1)
@@ -54,6 +56,7 @@ final class OrderedPipeline: @unchecked Sendable {
         }
         let index = submitted
         submitted += 1
+        peakHeld = max(peakHeld, submitted - delivered)
         condition.unlock()
         queue.async { [self] in
             let result = job()
@@ -114,6 +117,13 @@ final class OrderedPipeline: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return stopped
+    }
+
+    /// The most chunks held at once, running or waiting to be taken.
+    var peak: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return peakHeld
     }
 }
 
@@ -334,7 +344,10 @@ enum ArchiveFormat: String, Sendable {
 /// OneFile's own files decompress on every core: each gzip member says in its header how long it
 /// is (see `BlockCompressor`), so does the skippable frame before each zstd frame (see `Zstd`), and
 /// each xz stream is listed in the index at its end, so every piece can be found and decompressed
-/// at once. Other files decompress in order, on one core.
+/// at once. Other tools' files mostly do too: xz's index lists the blocks `xz -T0` cuts its stream
+/// into, pzstd's frames are laid out like OneFile's, and a gzip file's one long stream is cut up
+/// and pieced back together (see `ParallelGzip`). The rest decompress in order, on one core:
+/// zstd's single frames (quick anyway), and xz streams of one block.
 enum ArchiveDecoder {
     /// Plain tar is read in pieces this big.
     static let readPiece = 8 << 20
@@ -344,6 +357,46 @@ enum ArchiveDecoder {
     static let largestPiece = 64 << 20
 
     static var decoders: Int { min(max(ProcessInfo.processInfo.activeProcessorCount, 2), 8) }
+
+    /// Cores that run at full speed: Apple silicon's performance cores, an Intel Mac's physical ones.
+    static let performanceCores: Int = {
+        for name in ["hw.perflevel0.physicalcpu", "hw.physicalcpu"] {
+            var value: Int32 = 0
+            var size = MemoryLayout<Int32>.size
+            if sysctlbyname(name, &value, &size, nil, 0) == 0 && value > 0 { return Int(value) }
+        }
+        return ProcessInfo.processInfo.activeProcessorCount
+    }()
+
+    /// Apple silicon's efficiency cores (none on an Intel Mac).
+    static let efficiencyCores: Int = {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("hw.perflevel1.physicalcpu", &value, &size, nil, 0) == 0 && value > 0 ? Int(value) : 0
+    }()
+
+    /// Whether this Mac has room to spare for decompressing on every core from the start, the
+    /// quickest way: cores enough that it doesn't crowd the writing, and memory enough that what it
+    /// holds (a few hundred MB more) doesn't matter. Not when working gently.
+    static var roomy: Bool {
+        !Work.gentle && isRoomy(performance: performanceCores, efficiency: efficiencyCores,
+                                memory: Int64(ProcessInfo.processInfo.physicalMemory))
+    }
+
+    /// Room to spare: 8 cores or more, an efficiency core counted as half a performance one, and
+    /// 16 GB or more. So an M1 Pro, M2 Pro, M3 Pro, M4 Pro, any Max or Ultra, or an 8-core Intel
+    /// Mac; not an M1 to M4 (4 performance cores), nor a Mac with 8 GB.
+    static func isRoomy(performance: Int, efficiency: Int, memory: Int64) -> Bool {
+        Double(performance) + Double(efficiency) / 2 >= 8 && memory >= 16 << 30
+    }
+
+    /// What decompressing on every core may hold at once: on a Mac with room to spare, an eighth of
+    /// its memory, at most 4 GB (speed comes first, and it has it); otherwise a sixteenth, at most
+    /// 1 GB (512 MB on a Mac with 8 GB).
+    static var memory: Int64 {
+        let physical = Int64(ProcessInfo.processInfo.physicalMemory)
+        return roomy ? min(physical / 8, 4 << 30) : min(physical / 16, 1 << 30)
+    }
 
     struct Started {
         let pipeline: OrderedPipeline
@@ -360,6 +413,12 @@ enum ArchiveDecoder {
             return Started(pipeline: pipeline, parallel: false)
         case .gzip:
             let indexed = file.bytes(Int(min(file.size, 32)), at: 0).flatMap { indexedMember($0) } != nil
+            if !indexed && file.size >= ParallelGzip.floor && ParallelGzip.fullSpeedCores >= 4 {
+                // Another tool's: one long stream, decompressed on every core when unpacking needs it.
+                let pipeline = OrderedPipeline(slots: 6)
+                run("OneFile gunzip") { ParallelGzip.read(file, from: 0, pipeline) }
+                return Started(pipeline: pipeline, parallel: true)
+            }
             let pipeline = OrderedPipeline(slots: indexed ? decoders + 2 : 4)
             run("OneFile gunzip") {
                 if indexed { readIndexedGzip(file, pipeline) } else { readGzip(file, from: 0, pipeline) }
@@ -373,13 +432,14 @@ enum ArchiveDecoder {
             }
             return Started(pipeline: pipeline, parallel: indexed)
         case .xz:
-            let streams = xzStreams(file)
-            let parallel = (streams?.count ?? 0) > 1 && streams!.allSatisfy { $0.holds <= Int64(largestPiece) }
-            let pipeline = OrderedPipeline(slots: parallel ? decoders + 2 : 4)
+            // OneFile's own files have a stream for each block; xz -T0's have one stream of blocks.
+            let blocks = xzBlocks(file)
+            let slots = xzSlots(blocks ?? [], cores: ProcessInfo.processInfo.activeProcessorCount, memory: memory)
+            let pipeline = OrderedPipeline(slots: blocks != nil ? slots : 4)
             run("OneFile unxz") {
-                if parallel, let streams { readIndexedXz(file, streams, pipeline) } else { readXz(file, pipeline) }
+                if let blocks { readXzBlocks(file, blocks, pipeline) } else { readXz(file, pipeline) }
             }
-            return Started(pipeline: pipeline, parallel: parallel)
+            return Started(pipeline: pipeline, parallel: blocks != nil)
         }
     }
 
@@ -483,7 +543,7 @@ enum ArchiveDecoder {
     }
 
     /// Decompresses gzip members one after another, from `start` to the end of the file.
-    private static func readGzip(_ file: InputFile, from start: Int64, _ pipeline: OrderedPipeline) {
+    static func readGzip(_ file: InputFile, from start: Int64, _ pipeline: OrderedPipeline) {
         let inputCapacity = 1 << 20
         let input = UnsafeMutablePointer<UInt8>.allocate(capacity: inputCapacity)
         defer { input.deallocate() }
@@ -569,6 +629,21 @@ enum ArchiveDecoder {
         let offset: Int64
         let size: Int64
         let holds: Int64
+        /// Its blocks, as its index lists them.
+        var blocks: [XzBlock] = []
+    }
+
+    /// One block of an xz stream: `xz -T0` (the default since xz 5.6) cuts the stream into blocks,
+    /// each compressed on its own, so each can be decompressed at the same time as the others.
+    struct XzBlock {
+        /// Where it starts, and its size with its padding.
+        let offset: Int64
+        let size: Int64
+        /// Its size without the padding, as the index gives it, and how much it holds.
+        let unpadded: Int64
+        let holds: Int64
+        /// Where its stream starts: the stream's header says which check the blocks carry.
+        let stream: Int64
     }
 
     /// The streams of an xz file, found from the end: each ends in a footer that says how long its
@@ -601,11 +676,15 @@ enum ArchiveDecoder {
                 }
                 return nil
             }
-            guard let records = number() else { return nil }
+            guard let records = number(), records >= 0, records <= Int64(index.count) else { return nil }
             var blocks: Int64 = 0
             var holds: Int64 = 0
+            var sizes: [(unpadded: Int64, holds: Int64)] = []
             for _ in 0..<records {
-                guard let unpadded = number(), let uncompressed = number() else { return nil }
+                // An unpadded size is at least a block header (8) and a byte; at most what's there.
+                guard let unpadded = number(), let uncompressed = number(), unpadded >= 9, unpadded < indexStart,
+                      uncompressed >= 0, uncompressed < 1 << 50 else { return nil }
+                sizes.append((unpadded, uncompressed))
                 blocks += (unpadded + 3) & ~3
                 holds += uncompressed
             }
@@ -613,17 +692,85 @@ enum ArchiveDecoder {
             guard start >= 0, let magic = file.bytes(6, at: start), magic == [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00] else {
                 return nil
             }
-            streams.append(XzStream(offset: start, size: end - start, holds: holds))
+            var stream = XzStream(offset: start, size: end - start, holds: holds)
+            var blockStart = start + 12
+            for size in sizes {
+                let padded = (size.unpadded + 3) & ~3
+                stream.blocks.append(XzBlock(offset: blockStart, size: padded, unpadded: size.unpadded, holds: size.holds, stream: start))
+                blockStart += padded
+            }
+            streams.append(stream)
             end = start
         }
         return streams.reversed()
     }
 
-    private static func readIndexedXz(_ file: InputFile, _ streams: [XzStream], _ pipeline: OrderedPipeline) {
-        for stream in streams {
-            guard pipeline.submit({ decodeXz(file, stream) }) else { return }
+    /// How many xz blocks to hold at once (decompressing, or waiting their turn). xz decompresses ten
+    /// times slower than gzip, so it gets every core: unpacking is nearly always waiting for it, so
+    /// holding fewer only makes it slower. On an M4 Max, 18 blocks at a time unpacked a 1.5 GB file
+    /// in 0.73 s, 10 at a time in 0.96 s; /usr/share's 19,270 files took 1.6 s and 1.9 s. They have
+    /// to fit in `memory`: each takes what it holds, its compressed bytes, and the decoder's
+    /// dictionary, which xz makes a third of a block (8 MB for its default, 64 MB for xz -9).
+    static func xzSlots(_ blocks: [XzBlock], cores: Int, memory: Int64) -> Int {
+        let holds = blocks.map(\.holds).max() ?? 0
+        let each = holds + (blocks.map(\.size).max() ?? 0) + max(8 << 20, holds / 3)
+        return min(cores + 2, max(2, Int(memory / max(each, 1))))
+    }
+
+    /// The biggest xz block decompressed on its own: `xz -9 -T0` makes blocks of 192 MB.
+    static let largestXzBlock: Int64 = 256 << 20
+
+    /// The blocks of an xz file, if there are several and they can be decompressed at once.
+    static func xzBlocks(_ file: InputFile) -> [XzBlock]? {
+        guard let blocks = xzStreams(file)?.flatMap(\.blocks), blocks.count > 1,
+              blocks.allSatisfy({ $0.holds <= largestXzBlock }) else { return nil }
+        return blocks
+    }
+
+    private static func readXzBlocks(_ file: InputFile, _ blocks: [XzBlock], _ pipeline: OrderedPipeline) {
+        for block in blocks {
+            guard pipeline.submit({ decodeXzBlock(file, block) }) else { return }
         }
         pipeline.finish()
+    }
+
+    /// Decompresses one block. Apple's decoder reads only whole streams, so the block is given one
+    /// of its own: its stream's header, then the block, then an index that lists only it, and a
+    /// footer. The decoder checks the block's CRC, and its sizes against that index.
+    static func decodeXzBlock(_ file: InputFile, _ block: XzBlock) -> Result<Chunk, DecodeError> {
+        var index: [UInt8] = [0]
+        func number(_ value: Int64) {
+            var value = UInt64(value)
+            while value >= 0x80 {
+                index.append(UInt8(value & 0x7F) | 0x80)
+                value >>= 7
+            }
+            index.append(UInt8(value))
+        }
+        number(1)
+        number(block.unpadded)
+        number(block.holds)
+        while index.count % 4 != 0 { index.append(0) }
+        func little(_ value: UInt32) -> [UInt8] { (0..<4).map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) } }
+        index += little(UInt32(crc32(0, index, uInt(index.count))))
+
+        let size = Int(block.size)
+        let whole = 12 + size + index.count + 12
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: whole, alignment: 16)
+        defer { buffer.deallocate() }
+        guard file.read(12, at: block.stream, into: buffer), file.read(size, at: block.offset, into: buffer + 12) else {
+            return .failure(DecodeError(message: unreadable))
+        }
+        let flags = [buffer.load(fromByteOffset: 6, as: UInt8.self), buffer.load(fromByteOffset: 7, as: UInt8.self)]
+        var footer = little(UInt32(index.count / 4 - 1)) + flags
+        footer = little(UInt32(crc32(0, footer, uInt(footer.count)))) + footer + [0x59, 0x5A]
+        index.withUnsafeBytes { (buffer + 12 + size).copyMemory(from: $0.baseAddress!, byteCount: index.count) }
+        footer.withUnsafeBytes { (buffer + 12 + size + index.count).copyMemory(from: $0.baseAddress!, byteCount: footer.count) }
+        guard let chunk = xzWhole(UnsafeRawBufferPointer(start: buffer, count: whole), holds: Int(block.holds)) else {
+            return .failure(DecodeError(message: damaged(block.offset)))
+        }
+        chunk.inputEnd = block.offset + block.size
+        return .success(chunk)
     }
 
     static func decodeXz(_ file: InputFile, _ stream: XzStream) -> Result<Chunk, DecodeError> {

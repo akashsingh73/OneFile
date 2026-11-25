@@ -12,6 +12,10 @@ struct OneFileTests {
     static func main() {
         Packer.stopDownloadingCloudFiles()
         let arguments = Array(CommandLine.arguments.dropFirst())
+        // For timing other settings: ONEFILE_GZIP_AHEAD (spans at once), ONEFILE_GZIP_SPAN (bytes).
+        let environment = ProcessInfo.processInfo.environment
+        if let ahead = environment["ONEFILE_GZIP_AHEAD"].flatMap(Int.init) { ParallelGzip.ahead = ahead }
+        if let span = environment["ONEFILE_GZIP_SPAN"].flatMap(Int.init) { ParallelGzip.span = span }
         if arguments.first == "--pack" {
             guard arguments.count == 3 || arguments.count == 4,
                   let method = PackMethod(rawValue: arguments.count == 4 ? arguments[3] : "plain") else {
@@ -40,6 +44,9 @@ struct OneFileTests {
         if arguments.first == "--unpack", arguments.count == 3 {
             exit(unpackBenchmark(arguments[1], arguments[2]) ? 0 : 1)
         }
+        if arguments.first == "--decode", arguments.count == 2 {
+            exit(decodeBenchmark(arguments[1]) ? 0 : 1)
+        }
         if arguments.first == "--inspect", arguments.count == 2 {
             exit(inspect(arguments[1]) ? 0 : 1)
         }
@@ -57,6 +64,12 @@ struct OneFileTests {
             let fixture = try Fixture()
             defer { fixture.remove() }
             roundTripTests(fixture, checks)
+            // ONEFILE_ONLY=everyCore runs just those (after the round trip, which makes the tar files).
+            if ProcessInfo.processInfo.environment["ONEFILE_ONLY"] == "everyCore" {
+                everyCoreTests(fixture, checks)
+                print(checks.failed == 0 ? "\nAll \(checks.passed) checks passed." : "\n\(checks.failed) checks FAILED.")
+                exit(checks.failed == 0 ? 0 : 1)
+            }
             for method in [PackMethod.gzip, .zstd, .xz] { compressedTests(fixture, method, checks) }
             estimateTests(fixture, checks)
             repeatTests(fixture, checks)
@@ -73,6 +86,7 @@ struct OneFileTests {
             backupTests(fixture, checks)
             cloudTests(fixture, checks)
             zstdTests(fixture, checks)
+            everyCoreTests(fixture, checks)
         } catch {
             checks.fail("Couldn't build the test folder: \(error)")
         }

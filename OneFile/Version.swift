@@ -4,5 +4,5 @@ import Foundation
 enum OneFileVersion {
     static let current = "3.0"
     /// Goes up with every build that's handed out.
-    static let build = "5"
+    static let build = "8"
 }

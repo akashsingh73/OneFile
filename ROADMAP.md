@@ -40,6 +40,8 @@ network, with nothing to install on it.
 
 ## Done
 
+- **Unpack other tools' files on every core**: `.tar.xz` from `xz` (its blocks, one to a core), and
+  `.tar.gz` from `tar` and `gzip` (one long stream, cut into spans and pieced back together).
 - **zstd**: a fourth method, Efficient (`.tar.zst`): smaller than Balanced and quicker, on every
   core, from zstd's own library.
 - **Command line**: the `onefile` command, for everything the app does.
