@@ -82,6 +82,12 @@ if [[ -f OneFile/AppIcon.icns ]]; then
   cp OneFile/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+# The licenses go with every copy of the app: OneFile's (MIT), and zstd's (BSD), which asks that
+# its notice come with any copy of a program built from it (the onefile command inside included).
+mkdir -p "$APP/Contents/Resources/Licenses"
+cp LICENSE "$APP/Contents/Resources/Licenses/OneFile-LICENSE.txt"
+cp Vendor/zstd/LICENSE "$APP/Contents/Resources/Licenses/zstd-LICENSE.txt"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

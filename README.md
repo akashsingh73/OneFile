@@ -530,4 +530,5 @@ install: see [ROADMAP.md](ROADMAP.md).
 ## License
 
 MIT: see [LICENSE](LICENSE). The zstd library in `Vendor/zstd` is Meta's, under the BSD license: see
-[Vendor/zstd/LICENSE](Vendor/zstd/LICENSE).
+[Vendor/zstd/LICENSE](Vendor/zstd/LICENSE). `build.sh` puts both licenses inside the app too
+(`OneFile.app/Contents/Resources/Licenses`), so they go with every copy of it.

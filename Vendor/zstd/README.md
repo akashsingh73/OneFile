@@ -12,6 +12,8 @@ BSD license in [LICENSE](LICENSE).
   the `zstd` program, the tests and the docs.
 - **OneFile's own:** `module.modulemap` (so Swift can `import CZstd`) and this file.
 - **Built** by `Tools/zstd.sh`, from `build.sh` and `test.sh`, into a static library in `build/`:
-  once, and again only when something here changes.
+  once, and again only when something here changes. `build.sh` also puts `LICENSE` inside the app
+  (`Contents/Resources/Licenses/zstd-LICENSE.txt`), as the BSD license asks of anything built from
+  this code.
 
 To update it: download a newer release, check its SHA-256, and replace `lib/` and `LICENSE`.
